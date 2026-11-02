@@ -4,7 +4,7 @@ COMPOSE := docker compose
 # testcontainers + Colima: use the socket path as seen from inside the VM.
 export TESTCONTAINERS_DOCKER_SOCKET_OVERRIDE ?= /var/run/docker.sock
 
-.PHONY: help up down clean ps logs build lint lint-go fmt test test-int test-e2e test-all vet trace-ride trace-logs demo postman postman-gen proto openapi-lint grpc-offers grpc-location rebuild-geo replay-dlq psql
+.PHONY: help up down clean ps logs build lint lint-go fmt test test-int test-e2e test-all vet trace-ride trace-logs demo demo-map postman postman-gen proto openapi-lint grpc-offers grpc-location rebuild-geo replay-dlq psql load-smoke load-location load-dispatch load-hotzone
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z0-9_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-12s\033[0m %s\n", $$1, $$2}'
@@ -55,6 +55,9 @@ trace-ride: ## Show what happened to a ride from the logs: make trace-ride RIDE=
 trace-logs: ## Every log line of a trace incl. HTTP bodies and message values: make trace-logs TRACE=<traceId>
 	@./scripts/trace-logs.sh $(TRACE)
 
+demo-map: ## Live OpenStreetMap demo of the API (run `make up` first)
+	open http://localhost:8080/demo/ 2>/dev/null || xdg-open http://localhost:8080/demo/
+
 demo: ## Scripted walkthrough with every request/response logged (COMPACT=1 for one-line JSON)
 	@./scripts/demo.sh
 
@@ -89,3 +92,15 @@ replay-dlq: ## Re-publish dead-lettered messages: make replay-dlq TOPIC=ride.com
 
 psql: ## Open psql on a service database: make psql DB=dispatch_db
 	$(COMPOSE) exec postgres psql -U postgres -d $(or $(DB),ride_db)
+
+load-smoke: ## k6: 10-second check that the load scripts work (run `make up` first)
+	./loadtest/run.sh location SMOKE=1
+
+load-location: ## k6: driver location ingestion, 250 → 4000 req/s (B1); results in loadtest/results, graphs in Grafana "Load test (k6)"
+	./loadtest/run.sh location
+
+load-dispatch: ## k6: full ride journey, 5 → 80 rides/s (B3-B6)
+	./loadtest/run.sh dispatch
+
+load-hotzone: ## k6: all rides in one area with 40 drivers (B3 contention)
+	./loadtest/run.sh hotzone

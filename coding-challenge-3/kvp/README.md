@@ -71,8 +71,10 @@ make up          # build + start all 10 containers, waits until healthy (~30 s a
 |---|---|
 | http://localhost:8080 | **REST API v1** (gateway) |
 | localhost:9090 | **gRPC API v2** (gateway): driver location stream and offer push, see [below](#24-grpc-api-v2) |
+| http://localhost:8080/demo/ | **Live map demo** (`make demo-map`): OpenStreetMap view of the [happy path](docs/sequence-diagram.md#1-happy-path-request--offer--accept--complete) on the real API; each sequence-diagram arrow lights up when the API confirms it; pause/prev/next, and open every step in Grafana, Redpanda or Adminer |
 | http://localhost:8080/docs/ | **Swagger UI**: the REST contract [api/openapi.yaml](api/openapi.yaml), with "Try it out" |
 | http://localhost:3000 | Grafana → Dashboards → *Dispatch overview* (logs, traces, metrics) |
+| http://localhost:8089 | **Adminer** (dev only, auto-login): browse `ride_db`, `driver_db`, `dispatch_db`; the map demo links each step to its rows |
 | http://localhost:8088 | Redpanda Console (topics, messages, consumer groups) |
 | `lazydocker` | Containers, logs, restarts in the terminal |
 
@@ -380,6 +382,7 @@ All detailed documents are in [docs/](docs/). The challenge requires [architectu
 | [patterns.md](docs/patterns.md) | Which design patterns are used, why, where in the code, at what cost, and how they work together? |
 | [testing.md](docs/testing.md) | How is it tested? (levels, every test, invariants, how the integration tests work, gaps) |
 | [scalability.md](docs/scalability.md) | How does it grow from 1k to 1M drivers? (load model, evolution, the 7 topics, 6 bottlenecks, 6 strategies, 5 trade-offs) |
+| [load-test-report.md](docs/load-test-report.md) | Where does it actually break? (k6 results, Grafana, bottleneck ranking, scaling actions); run it with `make load-location` ([loadtest/](loadtest/README.md)) |
 | [observability.md](docs/observability.md) | What happened to ride R001? (log format, trace-by-id, one trace per ride, dashboard, alerts) |
 | [local-development.md](docs/local-development.md) | How do I install, run, demo and test it on a Mac with Colima? (incl. Postman, config, troubleshooting) |
 | [adr/](docs/adr/README.md) | Why each decision was made (12 ADRs) |
