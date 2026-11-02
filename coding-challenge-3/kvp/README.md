@@ -71,7 +71,7 @@ make up          # build + start all 10 containers, waits until healthy (~30 s a
 |---|---|
 | http://localhost:8080 | **REST API v1** (gateway) |
 | localhost:9090 | **gRPC API v2** (gateway): driver location stream and offer push, see [below](#24-grpc-api-v2) |
-| http://localhost:8080/demo/ | **Live map demo** (`make demo-map`): OpenStreetMap view of the [happy path](docs/sequence-diagram.md#1-happy-path-request--offer--accept--complete) on the real API; each sequence-diagram arrow lights up when the API confirms it; pause/prev/next, and open every step in Grafana, Redpanda, Adminer or RedisInsight |
+| http://localhost:8080/demo/ | **Live map demo** (`make demo-map`): OpenStreetMap view of the [sequence diagrams](docs/sequence-diagram.md) §1 happy path, §2 reject → rematch, §4 two rides racing for one driver and §6 cancel vs accept, on the real API; each arrow lights up when the API confirms it; pause/prev/next, the full Grafana trace on every step, plus Redpanda, Adminer and RedisInsight links; live radius/timeout config |
 | http://localhost:8080/docs/ | **Swagger UI**: the REST contract [api/openapi.yaml](api/openapi.yaml), with "Try it out" |
 | http://localhost:3000 | Grafana → Dashboards → *Dispatch overview* (logs, traces, metrics) |
 | http://localhost:8089 | **Adminer** (dev only, auto-login): browse `ride_db`, `driver_db`, `dispatch_db`; the map demo links each step to its rows |
@@ -229,7 +229,7 @@ Full layout: [architecture §14](docs/architecture.md#14-repository-layout).
 
 ### 4.5 Matching strategy
 
-*Nearest `AVAILABLE` driver within `MATCH_RADIUS_M` (default 2000 m); equidistant drivers → smallest `driverId`.*
+*Nearest `AVAILABLE` driver within the configured radius (default 2000 m); equidistant drivers → smallest `driverId`. The radius and the offer timeout live in Redis (`config:dispatch`) and can be changed at runtime: `make config-set RADIUS=1500 TIMEOUT=20` ([details](docs/local-development.md#7-configuration)).*
 
 1. driver-service publishes every status and location change with a version. dispatch-service keeps a **Redis GEO set of AVAILABLE drivers**, updated by a Lua script that ignores older versions, so matching uses the **latest location**.
 2. `GEOSEARCH … BYRADIUS … ASC` returns candidates. The pure function `SelectNearest` drops excluded and non-available drivers, computes **Haversine** distance, cuts at the radius and sorts by `(distance, driverId)`.

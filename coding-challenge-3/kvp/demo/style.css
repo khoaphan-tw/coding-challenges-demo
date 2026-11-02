@@ -359,3 +359,16 @@ body.dark-map .leaflet-tile-pane { filter: invert(1) hue-rotate(185deg) brightne
   .panel.left { border-right: 0; }
   .sub, .top-right a { display: none; }
 }
+
+/* sequence scenarios + dispatch config */
+.group-h { font: 600 10px var(--mono); text-transform: uppercase; letter-spacing: .8px; color: var(--muted); margin: 14px 2px 6px; }
+.scene.seq h3 { font-size: 14px; }
+.sq-tr { flex: none; display: inline-flex; gap: 4px; }
+.sq-tr a { font: 600 9.5px var(--mono); padding: 1px 5px; border-radius: 4px; background: rgba(249,115,22,.14); color: #fb923c; border: 1px solid rgba(249,115,22,.35); white-space: nowrap; }
+.sq-tr a:hover { background: rgba(249,115,22,.25); text-decoration: none; }
+.cfg { margin: 12px 0 4px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--panel-2); }
+.cfg-h { font: 600 11px var(--mono); color: var(--text); display: flex; justify-content: space-between; gap: 6px; margin-bottom: 6px; }
+.cfg-h span { color: var(--muted); font-weight: 400; }
+.cfg-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 12px; color: var(--muted); }
+.cfg-row input { width: 64px; font: 500 12px var(--mono); padding: 3px 5px; border-radius: 5px; border: 1px solid var(--line); background: var(--bg); color: var(--text); }
+.cfg-row button { margin-left: auto; padding: 4px 10px; }

@@ -40,6 +40,7 @@
     rideOverride: {},     // rideId → fields to display
     posOverride: new Map(), // driverId → [lat, lng] to display
     ringOverride: null,   // Map driverId → offer, for the countdown ring
+    cfg: { matchRadiusM: 2000, offerTimeoutSeconds: 30, source: 'default', redisKey: 'config:dispatch' }, // GET /dispatch/config
   };
 
   // ---------- map ----------
@@ -424,15 +425,17 @@
     return [a, lerp(a, b, 0.5), b];
   }
 
-  // Moves a driver along a path and reports each position to the API (real PUT /location calls).
+  // Moves a driver along a path and reports its position to the API every LOCATION_EVERY_MS
+  // (real PUT /location calls), plus once on arrival. The marker itself moves smoothly.
+  const LOCATION_EVERY_MS = 2000;
   async function animateDriver(tok, id, path, ms) {
     const m = S.markers.get(id); if (!m) return;
     S.animating.add(id);
     const cum = [0];
     for (let i = 1; i < path.length; i++) cum.push(cum[i - 1] + haversine(path[i - 1], path[i]));
     const total = cum[cum.length - 1] || 1;
-    let lastSent = 0;
     const t0 = performance.now();
+    let lastSent = t0; // the start position is already stored
     try {
       await new Promise((res) => {
         const f = (t) => {
@@ -442,7 +445,7 @@
           const seg = cum[i] - cum[i - 1] || 1;
           const p = lerp(path[i - 1], path[i], (dist - cum[i - 1]) / seg);
           m.setLatLng(p);
-          if (t - lastSent > 650 || k === 1) {
+          if (t - lastSent >= LOCATION_EVERY_MS || k === 1) {
             lastSent = t;
             api('PUT', `/drivers/${id}/location`, { latitude: +p[0].toFixed(6), longitude: +p[1].toFixed(6) }).catch(() => {});
           }
@@ -772,8 +775,8 @@
       sceneLayer.clearLayers();
       S.free.pickup = p; S.free.dest = null;
       pin(p, 'pickup', 'pickup');
-      L.circle(p, { radius: 2000, color: '#7c9cff', weight: 1, fillOpacity: 0.05, dashArray: '4 6', interactive: false }).addTo(sceneLayer);
-      say('Free play', 'Now click the destination', 'The dashed circle is the 2 km matching radius.');
+      L.circle(p, { radius: S.cfg.matchRadiusM, color: '#7c9cff', weight: 1, fillOpacity: 0.05, dashArray: '4 6', interactive: false }).addTo(sceneLayer);
+      say('Free play', 'Now click the destination', `The dashed circle is the ${fmtM(S.cfg.matchRadiusM)} matching radius (from Redis <b>config:dispatch</b>).`);
       $('#requestBtn').disabled = true;
     } else {
       S.free.dest = p;
@@ -788,7 +791,7 @@
     if (!r.ok) { toast(`${r.status} ${r.data?.code}`, true); return; }
     focusRides([r.data.rideId]);
     showTab('events');
-    say('Free play', `${pid} requested a ride`, 'Watch the saga steps on the right. Click the offered driver to accept or reject, or let the 30 s timer expire to see a timeout rematch.');
+    say('Free play', `${pid} requested a ride`, `Watch the saga steps on the right. Click the offered driver to accept or reject, or let the ${S.cfg.offerTimeoutSeconds} s timer expire to see a timeout rematch.`);
   });
 
 
@@ -803,12 +806,13 @@
   const TOOLS = { grafana: `http://${HOST}:3000`, redpanda: `http://${HOST}:8088`, db: `http://${HOST}:8089`, redis: `http://${HOST}:5540` };
   const RI_DB = '0'; // RedisInsight id of the database preconfigured by RI_REDIS_HOST (docker-compose.yml)
   const gExplore = (pane) => `${TOOLS.grafana}/explore?schemaVersion=1&orgId=1&panes=${encodeURIComponent(JSON.stringify({ a: pane }))}`;
-  const gLogs = (c, svc) => gExplore({
+  const gLogs = (c, svc, key = 'R1') => gExplore({
     datasource: 'loki',
-    queries: [{ refId: 'A', datasource: { type: 'loki', uid: 'loki' }, expr: `${svc ? `{service_name="${svc}"}` : '{service_name=~".+"}'} | ride_id="${c.R1}"` }],
+    queries: [{ refId: 'A', datasource: { type: 'loki', uid: 'loki' }, expr: `${svc ? `{service_name="${svc}"}` : '{service_name=~".+"}'} | ride_id="${c[key]}"` }],
     range: { from: String(new Date(c.T0 || Date.now()).getTime() - 60000), to: 'now' },
   });
-  const gTrace = (c) => gExplore({ datasource: 'tempo', queries: [{ refId: 'A', datasource: { type: 'tempo', uid: 'tempo' }, queryType: 'traceql', query: c.traceId }], range: { from: 'now-6h', to: 'now' } });
+  const gTraceId = (id) => gExplore({ datasource: 'tempo', queries: [{ refId: 'A', datasource: { type: 'tempo', uid: 'tempo' }, queryType: 'traceql', query: id }], range: { from: 'now-6h', to: 'now' } });
+  const gTrace = (c) => gTraceId(c.traceId);
   const gDash = () => `${TOOLS.grafana}/d/ridehail-dispatch/dispatch-overview?orgId=1&from=now-15m&to=now`;
   const rp = (topic, q) => `${TOOLS.redpanda}/topics/${topic}?q=${encodeURIComponent(q)}#messages`;
   function adm(db, table, col, val, order) {
@@ -817,13 +821,15 @@
     if (order) { p.set('order[0]', order); p.set('desc[0]', '1'); }
     return `${TOOLS.db}/?${p}`;
   }
-  const logs = (svc) => (c) => ['Grafana', `${svc ? svc.replace('-service', '') : 'all'} logs`, gLogs(c, svc)];
+  const logs = (svc, key = 'R1', tag = '') => (c) => ['Grafana', `${tag}${svc ? svc.replace('-service', '') : 'all'} logs`, gLogs(c, svc, key)];
   const trace = (c) => ['Grafana', 'trace', gTrace(c)];
   const topic = (t, key = 'R1') => (c) => ['Redpanda', t, rp(t, c[key])];
   // RedisInsight cannot deep-link to a key, so the button opens Workbench and copies the command to run.
   const GEO = 'geo:drivers:available';
   const redis = (label, cmd) => (c) => ['Redis', label, `${TOOLS.redis}/${RI_DB}/workbench`, cmd(c)];
-  const redisDriver = redis('driver hash + GEO', (c) => `HGETALL driver:${c.drv}\nGEOPOS ${GEO} ${c.drv}`);
+  const redisDrv = (key) => (c) => { const cmd = `HGETALL driver:${c[key]}\nGEOPOS ${GEO} ${c[key]}`; return ['Redis', key === 'drv' ? 'driver hash + GEO' : `${c[key]} hash + GEO`, `${TOOLS.redis}/${RI_DB}/workbench`, cmd]; };
+  const redisDriver = redisDrv('drv');
+  const redisConfig = redis('config:dispatch', () => 'HGETALL config:dispatch');
   const table = (db, t, col, key, order) => (c) => ['DB', `${db.replace('_db', '')}.${t}`, adm(db, t, col, c[key], order)];
 
   const T = (c, at, from = c.T0, after = '') => (at && from ? `${after ? '+' : 'T+'}${Math.max(0, new Date(at) - new Date(from))} ms${after ? ' after ' + after : ''}` : '');
@@ -858,8 +864,8 @@
       proof: (c) => `<b>REQUESTED → MATCHING</b> · cause event <b>${ev(tr(c, 'MATCHING').cause.replace('event:', ''))}</b>`, at: (c) => tr(c, 'MATCHING').at,
       detail: (c) => tr(c, 'MATCHING'),
       links: [topic('ride.commands.v1'), topic('dispatch.replies.v1'), table('ride_db', 'ride_transitions', 'ride_id', 'R1', 'id')] },
-    { row: { f: LXS, t: LR, txt: 'GEOSEARCH pickup BYRADIUS 2 km ASC', ac: 'AC-04' },
-      kicker: 'Step 5 · AC-04 matching', title: 'Nearest available driver within 2 km',
+    { row: { f: LXS, t: LR, txt: (c) => `GEOSEARCH pickup BYRADIUS ${km(c)} ASC`, ac: 'AC-04' },
+      kicker: 'Step 5 · AC-04 matching', title: 'Nearest available driver within the radius',
       text: () => 'Redis GEO suggests candidates; Haversine orders them by (distance, driverId). Offline and far drivers are out.',
       proof: (c) => `“${esc(stepOf(c, 'RESERVING').detail)}” → <b>${c.drv}</b>`, at: (c) => stepOf(c, 'RESERVING').at,
       detail: (c) => ({ saga: { radiusM: c.x1.saga.radiusM, pickup: c.x1.saga.pickup }, step: stepOf(c, 'RESERVING') }),
@@ -876,9 +882,9 @@
       proof: (c) => `${c.drv} <b>AVAILABLE → OFFERED</b> · currentRideId <b>${ev(c.d1.currentRideId)}</b>`, at: (c) => c.d1.updatedAt,
       detail: (c) => c.d1,
       links: [table('driver_db', 'drivers', 'id', 'drv'), topic('driver.events.v1', 'drv'), topic('dispatch.replies.v1'), redisDriver, logs('driver-service')] },
-    { row: { f: LXS, t: LXS, txt: '[tx] offer PENDING, expires +30 s', ac: 'AC-05' },
+    { row: { f: LXS, t: LXS, txt: (c) => `[tx] offer PENDING, expires +${secs(c)} s`, ac: 'AC-05' },
       kicker: 'Step 8 · AC-05 offer', title: 'A pending offer with a timeout',
-      text: (c) => `Offer <b>PENDING</b>, expires in <b>${c.offerSecs ?? 30} s</b> (the ring on the driver). If nobody answers, a timeout counts as a rejection.`,
+      text: (c) => `Offer <b>PENDING</b>, expires in <b>${c.offerSecs ?? secs(c)} s</b> (the ring on the driver). If nobody answers, a timeout counts as a rejection.`,
       proof: (c) => `offer <b>PENDING</b> · expires ${fmtT(c.offer.expiresAt).slice(0, 8)} (${c.offerSecs} s)`, at: (c) => c.offer.createdAt,
       detail: (c) => c.offer,
       links: [table('dispatch_db', 'offers', 'ride_id', 'R1'), logs('dispatch-service')] },
@@ -942,7 +948,7 @@
       links: [topic('driver.commands.v1'), table('driver_db', 'drivers', 'id', 'drv'), redisDriver, trace, logs(null)] },
   ];
 
-  const H = { active: false, idx: -1, reached: -1, playing: false, busy: false, failed: false, c: {}, tok: 0, loop: 0, finish: null, layout: null };
+  const H = { active: false, sc: null, idx: -1, reached: -1, playing: false, busy: false, failed: false, c: {}, tok: 0, loop: 0, finish: null, layout: null };
   const DWELL = 1500;
 
   async function happyCreate(c, tok) {
@@ -983,22 +989,22 @@
   function renderSeq() {
     const head = LANES.map((l) => `<div>${l}</div>`).join('');
     let n = 0;
-    const rows = HAPPY.map((s, si) => {
+    const rows = H.sc.steps.map((s, si) => {
       if (!s.row) return `<div class="sq-trip" id="sq-${si}">🚗 the trip · real PUT /location calls (AC-03)</div>`;
       const r = s.row, i = n++;
       const lo = Math.min(r.f, r.t), hi = Math.max(r.f, r.t), self = r.f === r.t;
       const left = ((lo + 0.5) / LANES.length) * 100, width = self ? 5 : ((hi - lo) / LANES.length) * 100;
       const lane = (k) => LANES[k].replace('-svc', '');
       return `<div class="sq-row" id="sq-${si}" data-step="${si}">
-        <div class="sq-txt"><b>${i + 1}</b> ${esc(r.txt)} <span class="sq-who">${self ? lane(r.f) : `${lane(r.f)} → ${lane(r.t)}`}</span></div>
+        <div class="sq-txt"><b>${i + 1}</b> ${esc(typeof r.txt === 'function' ? r.txt(H.c) : r.txt)} <span class="sq-who">${self ? lane(r.f) : `${lane(r.f)} → ${lane(r.t)}`}</span></div>
         <div class="sq-lanes">${LANES.map(() => '<i></i>').join('')}
           <div class="sq-arrow ${self ? 'self' : r.t < r.f ? 'rtl' : 'ltr'} ${r.async ? 'async' : ''}" style="left:${left}%;width:${width}%"></div>
         </div>
-        <div class="sq-ev"><span class="sq-ac">${r.ac}</span><span class="sq-proof">waiting…</span><span class="sq-t"></span></div>
+        <div class="sq-ev"><span class="sq-ac">${r.ac}</span><span class="sq-proof">waiting…</span><span class="sq-t"></span><span class="sq-tr"></span></div>
       </div>`;
     }).join('');
     $('#tab-seq').innerHTML = `<div class="sq-head">${head}</div>${rows}
-      <div class="sq-foot">Same flow as <code>docs/sequence-diagram.md</code> §1. Dashed = async via Redpanda (outbox → topic → inbox). Click a lit arrow to revisit it.</div>`;
+      <div class="sq-foot">Same flow as <code>docs/sequence-diagram.md</code> ${H.sc.ref}. Dashed = async via Redpanda (outbox → topic → inbox). Click a lit arrow to revisit it; <b>trace ↗</b> opens the ride's full trace in Grafana.</div>`;
   }
   $('#capLinks').addEventListener('click', (e) => {
     const a = e.target.closest('a[data-cmd]'); if (!a) return;
@@ -1006,6 +1012,7 @@
     toast('Copied for RedisInsight Workbench: paste (⌘V) and run (⌘/Ctrl+Enter). Shows Redis as it is now.');
   });
   $('#tab-seq').addEventListener('click', (e) => {
+    if (e.target.closest('a')) return; // a trace link, not a step change
     const row = e.target.closest('[data-step]');
     if (!row || !H.active) return;
     const i = +row.dataset.step;
@@ -1013,13 +1020,15 @@
   });
 
   function renderSeqState() {
-    HAPPY.forEach((s, si) => {
+    const traces = traceLinks(H.c);
+    H.sc.steps.forEach((s, si) => {
       const row = $('#sq-' + si); if (!row) return;
       row.classList.toggle('done', si <= H.idx);
       row.classList.toggle('now', si === H.idx);
       row.classList.toggle('reached', si <= H.reached);
       if (!s.row) return;
-      const proof = row.querySelector('.sq-proof'), t = row.querySelector('.sq-t');
+      const proof = row.querySelector('.sq-proof'), t = row.querySelector('.sq-t'), trc = row.querySelector('.sq-tr');
+      trc.innerHTML = si <= H.reached ? traces.map(([lab, url]) => `<a href="${esc(url)}" target="kvp-grafana" rel="noopener" title="Full trace of this ride in Grafana (Tempo)">${esc(lab)} ↗</a>`).join('') : '';
       if (si <= H.reached) {
         try {
           proof.innerHTML = s.proof(H.c);
@@ -1031,9 +1040,11 @@
   }
 
   function renderInfo() {
-    const s = HAPPY[H.idx], c = H.c, ready = H.idx <= H.reached;
+    const s = H.sc.steps[H.idx], c = H.c, ready = H.idx <= H.reached;
     say(s.kicker, s.title, s.text(c));
     const links = ready ? s.links.map((f) => { try { return f(c); } catch { return null; } }).filter(Boolean) : [];
+    // Every step: the full trace of each ride in this scenario, one click away.
+    if (ready) links.unshift(...traceLinks(c).map(([lab, url]) => ['Grafana', `full ${lab}`, url]));
     const groups = {};
     links.forEach(([tool, label, url, copy]) => {
       (groups[tool] ||= []).push(`<a href="${esc(url)}" target="kvp-${tool.toLowerCase()}" rel="noopener"${copy ? ` data-cmd="${esc(copy)}" title="Opens Workbench and copies:\n${esc(copy)}"` : ''}>${esc(label)} ${copy ? '⧉' : '↗'}</a>`);
@@ -1049,7 +1060,7 @@
   const driverStatusAt = (i) => (i < 6 ? 'AVAILABLE' : i <= 10 ? 'OFFERED' : i <= 15 ? 'BUSY' : 'AVAILABLE');
   const rideStatusAt = (i) => (i < 3 ? 'REQUESTED' : i < 8 ? 'MATCHING' : i < 12 ? 'DRIVER_ASSIGNED' : i < 14 ? 'DRIVER_ACCEPTED' : 'COMPLETED');
 
-  async function renderMap(i, forward, tok) {
+  async function happyMap(i, forward, tok) {
     const c = H.c, P = PLACES.opera, drv = c.drv || 'D001';
     sceneLayer.clearLayers();
     pin(P, 'pickup', 'P001 pickup'); pin(PLACES.tandinh, 'dest', 'destination');
@@ -1093,13 +1104,13 @@
   }
 
   function updateCtrl() {
-    const last = HAPPY.length - 1;
+    const last = H.sc.steps.length - 1;
     $('#cPrev').disabled = H.busy || H.idx <= 0;
     $('#cNext').disabled = H.busy || H.failed || H.idx >= last;
     $('#cPlay').disabled = H.busy && !H.playing || H.failed || H.idx >= last;
     $('#cPlay').textContent = H.playing ? '⏸ Pause' : '▶ Play';
     $('#cNext').textContent = H.busy ? 'running…' : H.idx + 1 > H.reached && H.idx < last ? 'Run next ▶' : 'Next ▶';
-    $('#cPos').textContent = `${H.idx + 1} / ${HAPPY.length}`;
+    $('#cPos').textContent = `${H.idx + 1} / ${H.sc.steps.length}`;
   }
 
   // ---- navigation ----
@@ -1107,37 +1118,38 @@
     const tok = H.tok;
     H.idx = i;
     renderInfo();
-    await renderMap(i, forward, tok);
+    await H.sc.map(i, forward, tok);
   }
   async function happyNext() {
-    if (H.busy || H.failed || H.idx >= HAPPY.length - 1) return;
-    const i = H.idx + 1, s = HAPPY[i], tok = H.tok;
+    if (H.busy || H.failed || H.idx >= H.sc.steps.length - 1) return;
+    const i = H.idx + 1, s = H.sc.steps[i], tok = H.tok;
     try {
       if (i > H.reached) {
         H.busy = true; updateCtrl();
-        if (s.live) { H.idx = i; renderInfo(); await renderMap(i, true, tok); }
+        if (s.live) { H.idx = i; renderInfo(); await H.sc.map(i, true, tok); }
         if (s.run) await s.run(H.c, tok);
         if (tok !== H.tok) return;
         H.reached = i; H.busy = false;
-        if (s.live) { renderInfo(); if (i === 0) await renderMap(i, false, tok); return; }
+        if (s.live) { renderInfo(); if (i === 0) await H.sc.map(i, false, tok); return; }
       }
       await happyGo(i, true);
     } catch (e) {
       if (tok !== H.tok || e instanceof Abort) return;
       H.busy = false; H.failed = true; H.playing = false;
       say('Stopped by the API', e.happy ? 'The offer is no longer pending' : e.message, e.happy || `${esc(e.message)}. Press <b>■ Stop</b> and run again.`);
+      renderSeqState();
       updateCtrl();
     }
   }
   function happyPrev() { if (!H.busy && H.idx > 0) { happyPause(); happyGo(H.idx - 1, false); } }
   function happyPause() { H.playing = false; H.loop++; updateCtrl(); }
   async function happyPlay() {
-    if (H.failed || H.idx >= HAPPY.length - 1) return;
+    if (H.failed || H.idx >= H.sc.steps.length - 1) return;
     H.playing = true; const loop = ++H.loop; updateCtrl();
-    while (H.playing && loop === H.loop && H.idx < HAPPY.length - 1 && !H.failed) {
+    while (H.playing && loop === H.loop && H.idx < H.sc.steps.length - 1 && !H.failed) {
       await happyNext();
       if (!H.playing || loop !== H.loop) break;
-      await sleep(HAPPY[H.idx]?.trip ? 300 : DWELL);
+      await sleep(H.sc.steps[H.idx]?.trip ? 300 : DWELL);
     }
     if (loop === H.loop) { H.playing = false; updateCtrl(); }
   }
@@ -1147,28 +1159,26 @@
     $('#ctrl').hidden = true; $('#capLinks').innerHTML = ''; $('#capDetail').hidden = true;
     S.override.clear(); S.posOverride.clear(); S.rideOverride = {}; S.ringOverride = null;
     S.markers.forEach((m) => { m.closePopup(); m.unbindPopup(); });
+    sql(null);
     let cancelled = false;
-    if (H.c.R1) {
-      const r = await getRide(H.c.R1).catch(() => null);
-      if (r && !TERMINAL.has(r.status)) { await api('POST', `/rides/${H.c.R1}/cancel`); cancelled = true; }
+    for (const id of H.sc.rides(H.c).filter(Boolean)) {
+      const r = await getRide(id).catch(() => null);
+      if (r && !TERMINAL.has(r.status)) { await api('POST', `/rides/${id}/cancel`); cancelled = true; }
     }
     poll();
     H.finish?.();
-    if (!quiet) say('Stopped', 'Happy path stopped', cancelled ? 'The open ride was <b>cancelled</b> (POST /cancel), so its driver is released. Press <b>Run happy path</b> to start again.' : 'Press <b>Run happy path</b> to start again.');
+    if (!quiet) say('Stopped', `${H.sc.title} stopped`, cancelled ? 'Open rides were <b>cancelled</b> (POST /cancel), so their drivers are released. Press <b>Run</b> to start again.' : 'Press <b>Run</b> to start again.');
   }
 
-  async function sceneHappy(tok) {
-    Object.assign(H, { active: true, idx: -1, reached: -1, playing: false, busy: false, failed: false, c: {}, tok });
-    H.layout = cityLayout({
-      D001: at(PLACES.opera, 800, 40, 'AVAILABLE'),
-      D002: at(PLACES.opera, 1500, 215, 'AVAILABLE'),
-      D003: at(PLACES.opera, 2500, 300, 'AVAILABLE'),
-      D011: at(PLACES.opera, 420, 120, 'OFFLINE'),
-    });
+  // Runs one step-player scenario (PLAYERS): the happy path or a sequence-diagram flow.
+  async function scenePlayer(tok, key) {
+    const sc = PLAYERS[key];
+    Object.assign(H, { active: true, sc, idx: -1, reached: -1, playing: false, busy: false, failed: false, c: {}, tok });
+    H.layout = sc.layout();
+    H.c.cfg = await getConfig();
     renderSeq();
     showTab('seq');
-    map.flyTo(PLACES.opera, 14.4, { duration: 0.8 });
-    S.override.set('D001', 'AVAILABLE');
+    map.flyTo(sc.center, sc.zoom || 14.4, { duration: 0.8 });
     await resetCity(tok, H.layout);
     $('#ctrl').hidden = false;
     const done = new Promise((res) => { H.finish = res; });
@@ -1184,12 +1194,424 @@
   $('#cDetail').addEventListener('click', () => { const d = $('#capDetail'); d.hidden = !d.hidden; $('#cDetail').classList.toggle('on', !d.hidden); });
   setInterval(() => {
     const w = $('#cWarn');
-    if (!H.active || !H.c.offer || H.reached >= 10) { w.textContent = ''; return; }
-    const left = Math.round((new Date(H.c.offer.expiresAt) - Date.now()) / 1000);
+    const offer = H.active && H.sc.pendingOffer?.(H.c, H.reached);
+    if (!offer) { w.textContent = ''; return; }
+    const left = Math.round((new Date(offer.expiresAt) - Date.now()) / 1000);
     w.className = left <= 0 ? 'bad' : left <= 10 ? 'warn' : '';
     w.textContent = left > 0 ? `offer expires in ${left}s` : 'offer expired: accept will fail (AC-05 timeout)';
   }, 500);
 
+
+  // ---------- dispatch config (Redis config:dispatch) ----------
+  async function getConfig() {
+    try {
+      const r = await api('GET', '/dispatch/config', null, { quiet: true });
+      if (r.ok) S.cfg = r.data;
+    } catch { /* gateway down */ }
+    renderConfig();
+    return S.cfg;
+  }
+  function renderConfig() {
+    const c = S.cfg;
+    if (document.activeElement !== $('#cfgRadius')) $('#cfgRadius').value = c.matchRadiusM;
+    if (document.activeElement !== $('#cfgTimeout')) $('#cfgTimeout').value = c.offerTimeoutSeconds;
+    $('#cfgSrc').textContent = c.source === 'default' ? 'defaults (Redis unavailable)' : `Redis · ${c.redisKey || 'config:dispatch'}`;
+  }
+  $('#cfgSave').addEventListener('click', async () => {
+    const r = await api('PUT', '/dispatch/config', { matchRadiusM: +$('#cfgRadius').value, offerTimeoutSeconds: +$('#cfgTimeout').value });
+    if (!r.ok) { toast(`${r.status} ${r.data?.code}: ${r.data?.detail || ''}`, true); return; }
+    S.cfg = r.data; renderConfig();
+    toast(`Saved to Redis: radius ${fmtM(r.data.matchRadiusM)}, offer timeout ${r.data.offerTimeoutSeconds} s. New rides and offers use it.`);
+  });
+  const secs = (c) => c.cfg?.offerTimeoutSeconds ?? 30;
+  const km = (c) => fmtM(c.cfg?.matchRadiusM ?? 2000);
+
+  // ---------- step-player helpers shared by the sequence scenarios ----------
+  // Full trace of every ride in the scenario: [label, Grafana URL].
+  function traceLinks(c) {
+    if (!H.sc) return [];
+    return H.sc.traces(c).filter(([, id]) => id).map(([lab, id]) => [lab, gTraceId(id)]);
+  }
+  const offerOf = (x, drv) => (x?.offers || []).filter((o) => o.driverId === drv).pop();
+  const stepsOf = (x, name, drv) => (x?.steps || []).filter((s) => s.step === name && (!drv || s.driverId === drv));
+  const lastTr = (h, to, from) => (h?.transitions || []).filter((t) => t.to === to && (!from || t.from === from)).pop();
+  const driver = async (id) => (await api('GET', `/drivers/${id}`, null, { quiet: true })).data;
+  const waitDriver = (tok, id, status) => waitFor(tok, async () => { const d = await driver(id); return d.status === status && !d.currentRideId === (status === 'AVAILABLE') && d; }, 15000);
+  const assignedTo = (tok, id, not) => waitFor(tok, async () => { const r = await getRide(id); return r.status === 'DRIVER_ASSIGNED' && r.assignedDriverId !== not && r; }, 15000);
+
+  // Shows statuses as they were at step i (the API is already further along).
+  function showAt(drivers, rides) {
+    S.override.clear();
+    Object.entries(drivers).forEach(([id, st]) => st && S.override.set(id, st));
+    S.rideOverride = rides;
+    S.drivers.forEach((d) => renderDriver(d));
+    renderRideCard();
+  }
+  // Pickup, radius and candidate lines. marks: driverId → 'rank' | 'excluded' | 'lost' | 'win'.
+  function drawCandidates(P, radius, ids, marks = {}) {
+    L.circle(P, { radius, color: '#7c9cff', weight: 1.5, fillColor: '#7c9cff', fillOpacity: 0.07, dashArray: '4 6', interactive: false }).addTo(sceneLayer);
+    label(offset(P, radius, 90), `radius ${fmtM(radius)}`, 'radius-label');
+    const ranked = H.layout.filter((x) => ids.includes(x.id)).map((x) => ({ ...x, dist: haversine(P, [x.lat, x.lng]) }))
+      .sort((a, b) => a.dist - b.dist || a.id.localeCompare(b.id));
+    let rank = 0;
+    for (const x of ranked) {
+      const pos = [x.lat, x.lng], m = marks[x.id];
+      if (x.status === 'OFFLINE') { line(P, pos, { color: '#6b7280', dashArray: '2 6' }); label(lerp(P, pos, 0.6), `${x.id} offline`, 'off'); continue; }
+      if (x.dist > radius) { line(P, pos, { color: '#ef4444', dashArray: '2 6' }); label(lerp(P, pos, 0.7), `${x.id} ${fmtM(x.dist)} · outside`, 'out'); continue; }
+      if (m === 'excluded') { line(P, pos, { color: '#ef4444', dashArray: '2 6' }); label(lerp(P, pos, 0.6), `${x.id} rejected · excluded`, 'out'); continue; }
+      rank++;
+      line(P, pos, { color: '#22c55e', className: rank === 1 ? 'flow-line' : '', weight: rank === 1 ? 4 : 2 });
+      label(lerp(P, pos, 0.6), `#${rank} ${x.id} · ${fmtM(x.dist)}`, rank === 1 ? 'rank' : 'in');
+    }
+  }
+  const step = (o) => o; // readability: a step of a sequence scenario
+
+  // ---------- sequence §2: reject → rematch (AC-05, AC-07) ----------
+  const REJ = { P: PLACES.opera, DEST: PLACES.tandinh, ids: ['D001', 'D002', 'D003', 'D011'] };
+  async function rejSetup(c, tok) {
+    c.created = await createRide('P002', REJ.P, REJ.DEST, `reject-${Date.now()}`);
+    if (!c.created.ok) throw new Error(`POST /rides → ${c.created.status}`);
+    c.R1 = c.created.data.rideId; c.traceId = c.created.data.traceId;
+    focusRides([c.R1]);
+    const r = await assignedTo(tok, c.R1);
+    c.drv1 = r.assignedDriverId;
+    [c.x1, c.h1] = await Promise.all([getDispatch(c.R1), getHistory(c.R1)]);
+    c.o1 = offerOf(c.x1, c.drv1);
+    c.traceId = c.traceId || r.traceId;
+  }
+  async function rejReject(c, tok) {
+    c.rej = await api('POST', `/rides/${c.R1}/offers/${c.drv1}/reject`);
+    if (!c.rej.ok) { const e = new Error(c.rej.data?.code || String(c.rej.status)); e.happy = `Reject refused: <b>${esc(c.rej.data?.code)}</b>. If the ${secs(c)} s offer expired while paused, the saga already treated it as a rejection. Stop and run again.`; throw e; }
+    const r = await assignedTo(tok, c.R1, c.drv1);
+    c.drv2 = r.assignedDriverId;
+    [c.x2, c.h2, c.dA, c.dB] = await Promise.all([getDispatch(c.R1), getHistory(c.R1), driver(c.drv1), driver(c.drv2)]);
+    c.o2 = offerOf(c.x2, c.drv2);
+  }
+  const REJECT = [
+    step({ row: { f: LP, t: LRS, txt: 'POST /rides → offer to the nearest (D001)', ac: 'AC-04' }, live: true,
+      kicker: 'Setup · AC-01 → AC-05', title: 'Ride R1 is offered to the nearest driver',
+      text: (c) => `Same start as the happy path: <b>POST /rides</b> → saga → nearest AVAILABLE driver within ${km(c)} → offer <b>O1 PENDING</b> (${secs(c)} s).`,
+      run: rejSetup,
+      proof: (c) => `ride <b>${ev(c.R1)}</b> <b>DRIVER_ASSIGNED</b> to <b>${c.drv1}</b> · offer O1 <b>PENDING</b>`,
+      detail: (c) => ({ ride: c.created.data, offer: c.o1 }),
+      links: [logs('dispatch-service'), table('dispatch_db', 'offers', 'ride_id', 'R1'), redisConfig] }),
+    step({ row: { f: LD, t: LXS, txt: 'POST …/offers/D001/reject', ac: 'AC-05' },
+      kicker: 'Step 2 · AC-05 reject', title: 'D001 rejects the offer',
+      text: () => 'Only the driver holding the current offer can answer. One conditional <b>UPDATE offers … WHERE status=\'PENDING\'</b>: reject, accept, timeout and cancel race on that row and exactly one wins.',
+      run: rejReject,
+      proof: (c) => `<b>${c.rej.status}</b> · offer O1 <b>${c.rej.data?.status}</b> · ${Math.round(c.rej.ms)} ms`,
+      detail: (c) => c.rej.data,
+      links: [table('dispatch_db', 'offers', 'ride_id', 'R1'), logs('dispatch-service')] }),
+    step({ row: { f: LXS, t: LXS, txt: '[tx] O1 REJECTED + exclusion(R1, D001), saga MATCHING', ac: 'AC-07' },
+      kicker: 'Step 3 · AC-07 exclusion', title: 'D001 is excluded from R1 for good',
+      text: () => 'In one transaction: the offer becomes <b>REJECTED</b>, <b>ride_exclusions(R1, D001)</b> is inserted, the saga goes back to <b>MATCHING</b>, and two compensations go to the outbox: <b>ReleaseDriver</b> and <b>UnassignDriver</b>.',
+      proof: (c) => `excluded: <b>${Object.entries(c.x2.exclusions || {}).map(([d, w]) => `${d} (${w})`).join(', ')}</b> · “${esc(stepsOf(c.x2, 'MATCHING', c.drv1).pop()?.detail || '')}”`,
+      at: (c) => stepsOf(c.x2, 'MATCHING', c.drv1).pop()?.at,
+      detail: (c) => ({ exclusions: c.x2.exclusions, offer: offerOf(c.x2, c.drv1), step: stepsOf(c.x2, 'MATCHING', c.drv1).pop() }),
+      links: [table('dispatch_db', 'ride_exclusions', 'ride_id', 'R1'), table('dispatch_db', 'saga_steps', 'ride_id', 'R1', 'id'), table('dispatch_db', 'outbox', 'msg_key', 'R1', 'id')] }),
+    step({ row: { f: LXS, t: LDS, txt: 'ReleaseDriver → D001 OFFERED → AVAILABLE', ac: 'AC-02', async: true },
+      kicker: 'Step 4 · AC-02 compensation', title: 'D001 is free again, for other rides',
+      text: () => 'driver-service applies <b>OFFERED → AVAILABLE</b>, only <b>WHERE current_ride_id = R1</b>, so a late release can never free a driver who moved on. D001 goes back into Redis GEO.',
+      proof: (c) => `${c.drv1} <b>${c.dA.status}</b> · currentRideId <b>${c.dA.currentRideId ? ev(c.dA.currentRideId) : 'null'}</b>`,
+      at: (c) => c.dA.updatedAt,
+      detail: (c) => c.dA,
+      links: [topic('driver.commands.v1', 'drv1'), table('driver_db', 'drivers', 'id', 'drv1'), redisDrv('drv1')] }),
+    step({ row: { f: LXS, t: LRS, txt: 'UnassignDriver → DRIVER_ASSIGNED → MATCHING', ac: 'AC-06', async: true },
+      kicker: 'Step 5 · AC-06 state machine', title: 'Ride back to MATCHING, assignedDriverId cleared',
+      text: () => 'The rejection transition: <b>DRIVER_ASSIGNED → MATCHING</b> with <b>assignedDriverId = null</b>, persisted in the state history. Commands are keyed by rideId, so Unassign and the next Assign arrive in order.',
+      proof: (c) => { const t = lastTr(c.h2, 'MATCHING', 'DRIVER_ASSIGNED'); return t ? `<b>DRIVER_ASSIGNED → MATCHING</b> · ${esc(t.action)}` : '…'; },
+      at: (c) => lastTr(c.h2, 'MATCHING', 'DRIVER_ASSIGNED')?.at,
+      detail: (c) => lastTr(c.h2, 'MATCHING', 'DRIVER_ASSIGNED'),
+      links: [topic('ride.commands.v1'), table('ride_db', 'ride_transitions', 'ride_id', 'R1', 'id')] }),
+    step({ row: { f: LXS, t: LR, txt: 'GEOSEARCH again, skipping {D001} → D002', ac: 'AC-07' },
+      kicker: 'Step 6 · AC-07 rematch', title: 'A new query, not the old list',
+      text: () => 'Matching runs again from Redis. D001 is AVAILABLE and the nearest, but it is in this ride\'s exclusions, so the next nearest eligible driver is chosen.',
+      proof: (c) => `“${esc(stepsOf(c.x2, 'RESERVING').pop()?.detail || '')}” → <b>${c.drv2}</b>`,
+      at: (c) => stepsOf(c.x2, 'RESERVING').pop()?.at,
+      detail: (c) => stepsOf(c.x2, 'RESERVING'),
+      links: [redis('GEOSEARCH', (c) => `GEOSEARCH ${GEO} FROMLONLAT ${c.x2.saga.pickup.longitude} ${c.x2.saga.pickup.latitude} BYRADIUS ${c.x2.saga.radiusM} m ASC WITHDIST`), table('dispatch_db', 'saga_steps', 'ride_id', 'R1', 'id')] }),
+    step({ row: { f: LXS, t: LDS, txt: "ReserveDriver(D002): UPDATE … WHERE status='AVAILABLE'", ac: 'AC-09', async: true },
+      kicker: 'Step 7 · AC-09', title: 'D002 is reserved atomically',
+      text: () => 'Same compare-and-set as every reservation: 1 row = reserved, 0 rows = someone else won.',
+      proof: (c) => `${c.drv2} <b>AVAILABLE → OFFERED</b> · currentRideId <b>${ev(c.dB.currentRideId)}</b>`,
+      at: (c) => c.dB.updatedAt,
+      detail: (c) => c.dB,
+      links: [table('driver_db', 'drivers', 'id', 'drv2'), redisDrv('drv2'), logs('driver-service')] }),
+    step({ row: { f: LXS, t: LRS, txt: 'AssignDriver(D002) → DRIVER_ASSIGNED', ac: 'AC-05', async: true },
+      kicker: 'Step 8 · AC-05', title: 'New offer O2 to D002',
+      text: (c) => `Offer <b>O2 PENDING</b> with a fresh ${secs(c)} s timer. D001 never sees R1 again.`,
+      proof: (c) => `<b>MATCHING → DRIVER_ASSIGNED</b> · ${c.drv2} · offer O2 <b>${c.o2?.status}</b>`,
+      at: (c) => lastTr(c.h2, 'DRIVER_ASSIGNED')?.at,
+      detail: (c) => ({ transition: lastTr(c.h2, 'DRIVER_ASSIGNED'), offer: c.o2 }),
+      links: [table('dispatch_db', 'offers', 'ride_id', 'R1'), table('ride_db', 'rides', 'id', 'R1')] }),
+    step({ row: { f: LD, t: LXS, txt: 'D002 accepts (pivot)', ac: 'AC-05' },
+      kicker: 'Step 9 · AC-05 accept', title: 'D002 accepts',
+      text: () => 'The pivot: from here the saga only moves forward. Ride <b>DRIVER_ACCEPTED</b>, driver <b>BUSY</b>.',
+      run: async (c, tok) => {
+        c.acc = await api('POST', `/rides/${c.R1}/offers/${c.drv2}/accept`);
+        if (!c.acc.ok) { const e = new Error(c.acc.data?.code); e.happy = `Accept refused: <b>${esc(c.acc.data?.code)}</b> (offer expired while paused?). Stop and run again.`; throw e; }
+        await waitFor(tok, async () => (await getRide(c.R1)).status === 'DRIVER_ACCEPTED');
+      },
+      proof: (c) => `<b>${c.acc.status}</b> · offer O2 <b>${c.acc.data?.status}</b>`,
+      detail: (c) => c.acc.data,
+      links: [table('dispatch_db', 'offers', 'ride_id', 'R1'), logs('dispatch-service')] }),
+    step({ row: { f: LD, t: LRS, txt: 'Complete → D002 AVAILABLE · D001 never re-offered', ac: 'AC-07' },
+      kicker: 'Done · AC-07', title: 'Rematched, accepted, completed',
+      text: (c) => `Offers for this ride: <b>${(c.x3?.offers || []).map((o) => `${o.driverId} ${o.status}`).join(' · ')}</b>. The rejected driver stayed AVAILABLE for other rides the whole time.`,
+      run: async (c, tok) => {
+        c.done = await api('POST', `/rides/${c.R1}/complete`);
+        c.dB2 = await waitDriver(tok, c.drv2, 'AVAILABLE');
+        c.x3 = await getDispatch(c.R1);
+      },
+      proof: (c) => `<b>${c.done.data?.status}</b> · ${c.drv2} <b>AVAILABLE</b> · excluded: <b>${Object.keys(c.x3.exclusions || {}).join(', ')}</b>`,
+      detail: (c) => ({ offers: c.x3.offers, exclusions: c.x3.exclusions }),
+      links: [table('dispatch_db', 'offers', 'ride_id', 'R1'), table('ride_db', 'ride_transitions', 'ride_id', 'R1', 'id'), logs(null)] }),
+  ];
+  async function rejMap(i, forward, tok) {
+    const c = H.c, d1 = c.drv1 || 'D001', d2 = c.drv2 || 'D002';
+    sceneLayer.clearLayers();
+    pin(REJ.P, 'pickup', 'P002 pickup'); pin(REJ.DEST, 'dest', 'destination');
+    const radius = c.x1?.saga.radiusM || c.cfg?.matchRadiusM || 2000;
+    if (forward && i === 0) await growCircle(REJ.P, radius);
+    if (tok !== S.token) return;
+    drawCandidates(REJ.P, radius, REJ.ids, i >= 2 ? { [d1]: 'excluded' } : {});
+    showAt(
+      { [d1]: i <= 2 ? 'OFFERED' : 'AVAILABLE', [d2]: i < 6 ? 'AVAILABLE' : i <= 7 ? 'OFFERED' : i === 8 ? 'BUSY' : 'AVAILABLE' },
+      c.R1 ? { [c.R1]: { status: i <= 3 ? 'DRIVER_ASSIGNED' : i <= 6 ? 'MATCHING' : i === 7 ? 'DRIVER_ASSIGNED' : i === 8 ? 'DRIVER_ACCEPTED' : 'COMPLETED',
+        assignedDriverId: i <= 3 ? d1 : i <= 6 ? null : d2 } } : {});
+    S.ringOverride = i <= 1 && c.o1 ? new Map([[d1, H.reached >= 2 ? { ...c.o1, frozen: true } : c.o1]])
+      : i === 7 && c.o2 ? new Map([[d2, H.reached >= 8 ? { ...c.o2, frozen: true } : c.o2]]) : null;
+    S.markers.forEach((_, id) => drvEl(id)?.classList.toggle('win', (id === d1 && i <= 1) || (id === d2 && i >= 5 && i <= 8)));
+  }
+
+  // ---------- sequence §4: two rides race for the same driver (AC-09) ----------
+  const RACE = (() => { const Hh = PLACES.benthanh; return { H: Hh, A: offset(Hh, 380, 270), B: offset(Hh, 380, 90), DEST: PLACES.notredame }; })();
+  async function raceSetup(c, tok) {
+    const t0 = performance.now();
+    const [ra, rb] = await Promise.all([createRide('P003', RACE.A, RACE.DEST), createRide('P004', RACE.B, RACE.DEST)]);
+    if (!ra.ok || !rb.ok) throw new Error('POST /rides failed');
+    c.gap = Math.round(performance.now() - t0);
+    c.RA = ra.data.rideId; c.RB = rb.data.rideId; c.trA = ra.data.traceId; c.trB = rb.data.traceId;
+    focusRides([c.RA, c.RB], { [c.RA]: 'A', [c.RB]: 'B' });
+    const [x, y] = await waitFor(tok, async () => {
+      const [p, q] = await Promise.all([getRide(c.RA), getRide(c.RB)]);
+      return p.status === 'DRIVER_ASSIGNED' && q.status === 'DRIVER_ASSIGNED' && [p, q];
+    }, 15000, 120);
+    c.rA = x; c.rB = y;
+    [c.xA, c.xB] = await Promise.all([getDispatch(c.RA), getDispatch(c.RB)]);
+    c.winA = x.assignedDriverId === 'D001';
+    const [W, Lk] = c.winA ? ['A', 'B'] : ['B', 'A'];
+    Object.assign(c, { W, Lk, xW: c.winA ? c.xA : c.xB, xL: c.winA ? c.xB : c.xA, loserDrv: (c.winA ? y : x).assignedDriverId, RL: c.winA ? c.RB : c.RA });
+    c.lostStep = stepsOf(c.xL, 'MATCHING').find((s) => /taken by another ride/.test(s.detail || ''));
+    c.collided = !!c.lostStep;
+    c.first = (xx) => stepsOf(xx, 'RESERVING')[0];
+    c.dW = await driver('D001'); c.dL = await driver(c.loserDrv);
+    c.double = x.assignedDriverId === y.assignedDriverId;
+  }
+  const RACE_STEPS = [
+    step({ row: { f: LP, t: LRS, txt: 'A and B: POST /rides at the same instant', ac: 'AC-09' }, live: true,
+      kicker: 'Step 1 · AC-09 the race', title: 'Two passengers, 380 m from D001 each',
+      text: () => 'P003 (A) and P004 (B) are both <b>380 m</b> from D001, the nearest driver. Both <b>POST /rides</b> are sent together (Promise.all).',
+      run: raceSetup,
+      proof: (c) => `A <b>${ev(c.RA)}</b> · B <b>${ev(c.RB)}</b> · both <b>201</b> in ${c.gap} ms`,
+      detail: (c) => ({ A: c.rA, B: c.rB }),
+      links: [logs('ride-service', 'RA', 'A '), logs('ride-service', 'RB', 'B ')] }),
+    step({ row: { f: LRS, t: LXS, txt: 'RideRequested ×2 → two sagas', ac: 'AC-10', async: true },
+      kicker: 'Step 2 · AC-10', title: 'Two independent sagas start',
+      text: () => 'Each ride has its own saga (primary key = rideId) and runs on its own partition. Nothing coordinates them: the database will.',
+      proof: (c) => `saga A <b>STARTED</b> ${T(c, stepsOf(c.xA, 'STARTED')[0]?.at, c.rA.createdAt, 'request')} · saga B <b>STARTED</b>`,
+      at: (c) => stepsOf(c.xA, 'STARTED')[0]?.at,
+      detail: (c) => ({ A: stepsOf(c.xA, 'STARTED')[0], B: stepsOf(c.xB, 'STARTED')[0] }),
+      links: [topic('ride.events.v1', 'RA'), table('dispatch_db', 'dispatch_sagas', 'ride_id', 'RA'), table('dispatch_db', 'dispatch_sagas', 'ride_id', 'RB')] }),
+    step({ row: { f: LXS, t: LR, txt: 'Both GEOSEARCH → nearest is D001', ac: 'AC-04' },
+      kicker: 'Step 3 · AC-04', title: 'Both sagas want the same driver',
+      text: () => 'Redis is a snapshot: both sagas may read D001 as AVAILABLE before either reservation lands. This is the race the challenge asks about.',
+      proof: (c) => `A → <b>${c.first(c.xA)?.driverId}</b> · B → <b>${c.first(c.xB)?.driverId}</b>${c.collided ? ' · <b style="color:var(--offered)">same driver</b>' : ''}`,
+      at: (c) => c.first(c.xA)?.at,
+      detail: (c) => ({ A: c.first(c.xA), B: c.first(c.xB) }),
+      links: [redis('GEOSEARCH', () => `GEOSEARCH ${GEO} FROMLONLAT ${RACE.H[1]} ${RACE.H[0]} BYRADIUS 2000 m ASC WITHDIST`), table('dispatch_db', 'saga_steps', 'ride_id', 'RA', 'id'), table('dispatch_db', 'saga_steps', 'ride_id', 'RB', 'id')] }),
+    step({ row: { f: LXS, t: LDS, txt: 'ReserveDriver(A, D001) ∥ ReserveDriver(B, D001)', ac: 'AC-09', async: true },
+      kicker: 'Step 4 · AC-09', title: 'Two reservations for D001',
+      text: (c) => c.collided ? 'Both commands reach driver-service. A "read status, then write" would let both succeed (a lost update).'
+        : 'This round the GEO index had already dropped D001 when the second saga searched, so only one command targeted D001. Run again to see a database collision; either way the guard is the same.',
+      proof: (c) => c.collided ? 'both sagas sent <b>ReserveDriver(D001)</b>' : `only ${c.W} sent ReserveDriver(D001); ${c.Lk} went to <b>${c.loserDrv}</b>`,
+      detail: (c) => ({ winner: c.first(c.xW), loser: c.first(c.xL) }),
+      links: [topic('driver.commands.v1', 'RA'), logs('driver-service', 'RA', 'A '), logs('driver-service', 'RB', 'B ')] }),
+    step({ row: { f: LDS, t: LDS, txt: "UPDATE … WHERE status='AVAILABLE' → 1 row ✔ / 0 rows ✘", ac: 'AC-09' },
+      kicker: 'Step 5 · AC-09 compare-and-set', title: 'Postgres lets exactly one through',
+      text: () => 'Row locking serialises the two UPDATEs. The second re-checks <b>status=\'AVAILABLE\'</b>, finds <b>OFFERED</b>, and updates <b>0 rows</b>. The row count is the answer: no lock service needed.',
+      proof: (c) => `${c.W}: <b>1 row ✔</b> (D001 OFFERED for ${c.W}) · ${c.Lk}: ${c.collided ? '<b>0 rows ✘</b>' : 'not attempted'}`,
+      at: (c) => c.dW.updatedAt,
+      detail: (c) => c.dW,
+      links: [table('driver_db', 'drivers', 'id', 'drvW'), redis('D001 hash + GEO', () => `HGETALL driver:D001\nGEOPOS ${GEO} D001`)] }),
+    step({ row: { f: LDS, t: LXS, txt: 'DriverReservationFailed → loser tries the next driver', ac: 'AC-09', async: true },
+      kicker: 'Step 6 · AC-09', title: 'The loser moves on',
+      text: (c) => `Saga ${c.Lk} adds D001 to this round's skips and matches again.`,
+      proof: (c) => c.collided ? `${c.Lk}: “${esc(c.lostStep.detail)}”` : `${c.Lk} skipped D001 via the GEO index`,
+      at: (c) => c.lostStep?.at,
+      detail: (c) => c.lostStep || stepsOf(c.xL, 'RESERVING'),
+      links: [topic('dispatch.replies.v1', 'RL'), table('dispatch_db', 'saga_steps', 'ride_id', 'RL', 'id')] }),
+    step({ row: { f: LXS, t: LRS, txt: 'A and B DRIVER_ASSIGNED to different drivers', ac: 'AC-09', async: true },
+      kicker: 'Step 7 · AC-09 result', title: 'One driver, one ride',
+      text: (c) => `${c.W} got <b>D001</b>, ${c.Lk} got <b>${c.loserDrv}</b>. ${c.double ? '<b style="color:var(--excluded)">DOUBLE BOOKING!</b>' : 'No driver holds two offers; partial unique indexes on offers back this up.'}`,
+      proof: (c) => `A → <b>${c.rA.assignedDriverId}</b> · B → <b>${c.rB.assignedDriverId}</b> · double-bookings <b>${c.double ? 1 : 0}</b>`,
+      detail: (c) => ({ A: c.rA, B: c.rB }),
+      links: [table('dispatch_db', 'offers', 'status', 'pending'), table('ride_db', 'rides', 'id', 'RA'), table('ride_db', 'rides', 'id', 'RB')] }),
+    step({ row: { f: LP, t: LRS, txt: 'Cancel both → drivers released', ac: 'AC-06' },
+      kicker: 'Done · cleanup', title: 'Both rides cancelled, both drivers AVAILABLE',
+      text: () => 'Cancelling before acceptance returns each OFFERED driver to AVAILABLE (saga compensation).',
+      run: async (c, tok) => {
+        await Promise.all([c.RA, c.RB].map((id) => api('POST', `/rides/${id}/cancel`)));
+        c.relW = await waitDriver(tok, 'D001', 'AVAILABLE'); c.relL = await waitDriver(tok, c.loserDrv, 'AVAILABLE');
+      },
+      proof: (c) => `D001 <b>${c.relW.status}</b> · ${c.loserDrv} <b>${c.relL.status}</b>`,
+      detail: (c) => ({ D001: c.relW, [c.loserDrv]: c.relL }),
+      links: [logs(null, 'RA', 'A '), logs(null, 'RB', 'B ')] }),
+  ];
+  async function raceMap(i) {
+    const c = H.c, { H: Hh, A, B } = RACE;
+    sceneLayer.clearLayers();
+    pin(A, 'pickup', 'P003', 'A'); pin(B, 'pickup', 'P004', 'B'); pin(RACE.DEST, 'dest', 'destination');
+    label(lerp(A, Hh, 0.5), fmtM(haversine(A, Hh)), 'in'); label(lerp(B, Hh, 0.5), fmtM(haversine(B, Hh)), 'in');
+    c.drvW = 'D001'; c.pending = 'PENDING';
+    if (i < 4 || !c.RA) {
+      line(A, Hh, { color: '#f59e0b', weight: 3, className: 'bolt' }); line(B, Hh, { color: '#f59e0b', weight: 3, className: 'bolt' });
+    } else {
+      const [wp, lp] = c.winA ? [A, B] : [B, A];
+      line(wp, Hh, { color: '#22c55e', weight: 4 }); line(lp, Hh, { color: '#ef4444', dashArray: '3 6', weight: 2 });
+      label(lerp(wp, Hh, 0.5), `${c.W} wins D001`, 'rank');
+      if (i >= 5) line(lp, posOf(c.loserDrv), { color: '#22c55e', weight: 3, className: 'flow-line' });
+    }
+    sql(i >= 3 && i <= 5 ? RACE_SQL : null);
+    const ld = c.loserDrv || 'D002';
+    showAt({ D001: i < 4 ? 'AVAILABLE' : i <= 6 ? 'OFFERED' : 'AVAILABLE', [ld]: i < 6 ? 'AVAILABLE' : i === 6 ? 'OFFERED' : 'AVAILABLE' },
+      c.RA ? { [c.RA]: { status: i < 6 ? 'MATCHING' : i === 6 ? 'DRIVER_ASSIGNED' : 'CANCELLED', assignedDriverId: i === 6 ? c.rA.assignedDriverId : null },
+        [c.RB]: { status: i < 6 ? 'MATCHING' : i === 6 ? 'DRIVER_ASSIGNED' : 'CANCELLED', assignedDriverId: i === 6 ? c.rB.assignedDriverId : null } } : {});
+    S.markers.forEach((_, id) => drvEl(id)?.classList.toggle('win', id === 'D001' && i >= 2 && i <= 6));
+  }
+
+  // ---------- sequence §6: cancel races accept (AC-05, AC-06) ----------
+  const CXL = { P: PLACES.notredame, DEST: PLACES.bitexco, ids: ['D001', 'D002'] };
+  async function cxlRace(c, tok) {
+    const t0 = performance.now();
+    [c.cxl, c.acc] = await Promise.all([api('POST', `/rides/${c.R1}/cancel`), api('POST', `/rides/${c.R1}/offers/${c.drv1}/accept`)]);
+    c.gap = Math.round(performance.now() - t0);
+    c.xF = await waitFor(tok, async () => { const x = await getDispatch(c.R1); return x.saga.status === 'CANCELLED' && x; }, 15000);
+    c.dF = await waitDriver(tok, c.drv1, 'AVAILABLE');
+    c.hF = await getHistory(c.R1);
+    c.sCxl = stepsOf(c.xF, 'CANCELLED').pop();
+    c.accFirst = !!lastTr(c.hF, 'DRIVER_ACCEPTED');
+    c.oF = offerOf(c.xF, c.drv1);
+  }
+  const CANCEL = [
+    step({ row: { f: LP, t: LRS, txt: 'POST /rides → offered to D001 (O1 PENDING)', ac: 'AC-05' }, live: true,
+      kicker: 'Setup · AC-05', title: 'Ride R1 has a pending offer for D001',
+      text: (c) => `R1 is <b>DRIVER_ASSIGNED</b>, D001 is <b>OFFERED</b>, the offer has ${secs(c)} s left. Now two people act at the same moment.`,
+      run: async (c, tok) => {
+        c.created = await createRide('P005', CXL.P, CXL.DEST, `cancel-${Date.now()}`);
+        if (!c.created.ok) throw new Error(`POST /rides → ${c.created.status}`);
+        c.R1 = c.created.data.rideId; c.traceId = c.created.data.traceId;
+        focusRides([c.R1]);
+        c.r1 = await assignedTo(tok, c.R1); c.drv1 = c.r1.assignedDriverId;
+        c.x1 = await getDispatch(c.R1); c.o1 = offerOf(c.x1, c.drv1);
+      },
+      proof: (c) => `ride <b>${ev(c.R1)}</b> <b>DRIVER_ASSIGNED</b> · ${c.drv1} <b>OFFERED</b> · O1 <b>PENDING</b>`,
+      detail: (c) => ({ ride: c.r1, offer: c.o1 }),
+      links: [table('dispatch_db', 'offers', 'ride_id', 'R1'), logs('dispatch-service')] }),
+    step({ row: { f: LP, t: LRS, txt: 'par ① passenger: POST /rides/R1/cancel', ac: 'AC-06' },
+      kicker: 'Step 2 · race · passenger', title: 'The passenger cancels…',
+      text: () => 'Sent <b>in parallel</b> with the driver\'s accept (Promise.all). ride-service owns the lifecycle and decides the cancellation in its own transaction.',
+      run: cxlRace,
+      proof: (c) => `<b>${c.cxl.status}</b> · ride <b>${c.cxl.data?.status || c.cxl.data?.code}</b> · ${Math.round(c.cxl.ms)} ms`,
+      detail: (c) => c.cxl.data,
+      links: [logs('ride-service'), table('ride_db', 'rides', 'id', 'R1')] }),
+    step({ row: { f: LD, t: LXS, txt: 'par ② driver: POST …/offers/D001/accept', ac: 'AC-05' },
+      kicker: 'Step 3 · race · driver', title: '…while D001 taps Accept',
+      text: (c) => c.acc.ok ? 'dispatch-service owns the offer: <b>O1 PENDING → ACCEPTED</b> succeeds, because it has not heard about the cancel yet (that arrives as an event).'
+        : `The cancel reached dispatch first and cancelled the offer, so the accept finds no pending offer: <b>${esc(c.acc.data?.code)}</b>.`,
+      proof: (c) => `<b>${c.acc.status}</b> · ${c.acc.ok ? `offer <b>${c.acc.data?.status}</b>` : `<b>${esc(c.acc.data?.code)}</b>`} · ${Math.round(c.acc.ms)} ms`,
+      detail: (c) => c.acc.data,
+      links: [table('dispatch_db', 'offers', 'ride_id', 'R1'), logs('dispatch-service')] }),
+    step({ row: { f: LRS, t: LRS, txt: '[tx] → CANCELLED + outbox RideCancelled', ac: 'AC-06' },
+      kicker: 'Step 4 · AC-06', title: 'The ride is CANCELLED (terminal)',
+      text: () => 'CANCELLED and COMPLETED are terminal: no command can move the ride out of them.',
+      proof: (c) => { const t = lastTr(c.hF, 'CANCELLED'); return `<b>${t?.from} → CANCELLED</b> · ${esc(t?.action || '')}`; },
+      at: (c) => lastTr(c.hF, 'CANCELLED')?.at,
+      detail: (c) => c.hF.transitions,
+      links: [table('ride_db', 'ride_transitions', 'ride_id', 'R1', 'id'), table('ride_db', 'outbox', 'msg_key', 'R1', 'id'), topic('ride.events.v1')] }),
+    step({ row: { f: LXS, t: LRS, txt: 'MarkAccepted → refused: ride is terminal', ac: 'AC-06', async: true },
+      kicker: 'Step 5 · AC-06 invalid transition', title: 'The accept cannot revive a cancelled ride',
+      text: (c) => !c.acc.ok ? 'Not needed this time: the cancel won the offer row, so no MarkAccepted was sent.'
+        : c.accFirst ? 'This time MarkAccepted landed first (<b>DRIVER_ACCEPTED</b>), then the cancel moved the ride to <b>CANCELLED</b>, which is allowed. Same end state.'
+          : 'ride-service refuses <b>CANCELLED → DRIVER_ACCEPTED</b> and replies <b>CommandRejected</b>; the saga compensates.',
+      proof: (c) => !c.acc.ok ? 'not sent (offer was already CANCELLED)' : c.accFirst ? 'DRIVER_ACCEPTED, then CANCELLED' : 'no DRIVER_ACCEPTED in the ride history ✔',
+      detail: (c) => c.hF.transitions,
+      links: [topic('ride.commands.v1'), topic('dispatch.replies.v1'), table('ride_db', 'ride_transitions', 'ride_id', 'R1', 'id')] }),
+    step({ row: { f: LRS, t: LXS, txt: 'RideCancelled → saga CANCELLED (compensate)', ac: 'AC-10', async: true },
+      kicker: 'Step 6 · saga compensation', title: 'The saga cancels and compensates',
+      text: () => 'Whichever message arrives first (RideCancelled or CommandRejected) cancels the saga; the second is a no-op.',
+      proof: (c) => `saga <b>CANCELLED</b> · “${esc(c.sCxl?.detail || '')}” · offer O1 <b>${c.oF?.status}</b>`,
+      at: (c) => c.sCxl?.at,
+      detail: (c) => ({ saga: c.xF.saga, step: c.sCxl, offer: c.oF }),
+      links: [table('dispatch_db', 'dispatch_sagas', 'ride_id', 'R1'), table('dispatch_db', 'saga_steps', 'ride_id', 'R1', 'id')] }),
+    step({ row: { f: LXS, t: LDS, txt: 'ReleaseDriver → D001 AVAILABLE (WHERE current_ride_id = R1)', ac: 'AC-02', async: true },
+      kicker: 'Done · same end state, any order', title: 'Ride CANCELLED · saga CANCELLED · D001 AVAILABLE',
+      text: () => 'The release only applies while D001 still holds R1, and it follows MarkDriverBusy on the same driverId partition, so D001 can never be stuck in BUSY.',
+      proof: (c) => `${c.drv1} <b>${c.dF.status}</b> · currentRideId <b>null</b>`,
+      at: (c) => c.dF.updatedAt,
+      detail: (c) => c.dF,
+      links: [table('driver_db', 'drivers', 'id', 'drv1'), redisDrv('drv1'), logs(null)] }),
+  ];
+  async function cxlMap(i, forward, tok) {
+    const c = H.c, d1 = c.drv1 || 'D001';
+    sceneLayer.clearLayers();
+    pin(CXL.P, 'pickup', 'P005 pickup'); pin(CXL.DEST, 'dest', 'destination');
+    const radius = c.x1?.saga.radiusM || c.cfg?.matchRadiusM || 2000;
+    if (forward && i === 0) await growCircle(CXL.P, radius);
+    if (tok !== S.token) return;
+    drawCandidates(CXL.P, radius, CXL.ids);
+    const accepted = c.acc?.ok && i >= 2 && i <= 5;
+    showAt({ [d1]: i <= 1 ? 'OFFERED' : i === 6 ? 'AVAILABLE' : accepted && c.accFirst ? 'BUSY' : 'OFFERED' },
+      c.R1 ? { [c.R1]: { status: i <= 1 ? 'DRIVER_ASSIGNED' : i === 2 && c.accFirst ? 'DRIVER_ACCEPTED' : 'CANCELLED', assignedDriverId: i <= 2 ? d1 : null } } : {});
+    S.ringOverride = i <= 1 && c.o1 ? new Map([[d1, H.reached >= 1 ? { ...c.o1, frozen: true } : c.o1]]) : null;
+    S.markers.forEach((_, id) => drvEl(id)?.classList.toggle('win', id === d1 && i <= 5));
+  }
+
+  // ---------- the step-player scenarios ----------
+  const PLAYERS = {
+    happy: { title: 'Happy path', ref: '§1', steps: HAPPY, center: PLACES.opera, map: happyMap,
+      layout: () => cityLayout({
+        D001: at(PLACES.opera, 800, 40, 'AVAILABLE'),
+        D002: at(PLACES.opera, 1500, 215, 'AVAILABLE'),
+        D003: at(PLACES.opera, 2500, 300, 'AVAILABLE'),
+        D011: at(PLACES.opera, 420, 120, 'OFFLINE'),
+      }),
+      rides: (c) => [c.R1], traces: (c) => [['trace', c.traceId]],
+      pendingOffer: (c, reached) => reached < 10 && c.offer },
+    seqReject: { title: 'Reject → rematch', ref: '§2', steps: REJECT, center: REJ.P, map: rejMap,
+      layout: () => cityLayout({
+        D001: at(REJ.P, 600, 40, 'AVAILABLE'),
+        D002: at(REJ.P, 1100, 215, 'AVAILABLE'),
+        D003: at(REJ.P, 2500, 300, 'AVAILABLE'),
+        D011: at(REJ.P, 400, 120, 'OFFLINE'),
+      }),
+      rides: (c) => [c.R1], traces: (c) => [['trace', c.traceId]],
+      pendingOffer: (c, reached) => (reached < 1 ? c.o1 : reached === 7 ? c.o2 : null) },
+    seqRace: { title: 'Two rides, one driver', ref: '§4', steps: RACE_STEPS, center: RACE.H, zoom: 15.6, map: raceMap,
+      layout: () => cityLayout({
+        D001: at(RACE.H, 0, 0, 'AVAILABLE'),
+        D002: at(RACE.H, 950, 0, 'AVAILABLE'),
+        D003: at(RACE.H, 1050, 180, 'AVAILABLE'),
+      }),
+      rides: (c) => [c.RA, c.RB], traces: (c) => [['trace A', c.trA], ['trace B', c.trB]] },
+    seqCancel: { title: 'Cancel vs accept', ref: '§6', steps: CANCEL, center: CXL.P, zoom: 15, map: cxlMap,
+      layout: () => cityLayout({
+        D001: at(CXL.P, 700, 45, 'AVAILABLE'),
+        D002: at(CXL.P, 1500, 230, 'AVAILABLE'),
+      }),
+      rides: (c) => [c.R1], traces: (c) => [['trace', c.traceId]],
+      pendingOffer: (c, reached) => reached < 1 && c.o1 },
+  };
 
   // ---------- runner ----------
   async function run(name) {
@@ -1205,7 +1627,7 @@
     if (name === 'free') { S.running = false; setButtons(); enterFree(); return; }
     S.mode = name; S.running = true; setButtons();
     try {
-      if (name === 'happy') await sceneHappy(tok);
+      if (PLAYERS[name]) await scenePlayer(tok, name);
       if (name === 'match') await sceneMatch(tok);
       if (name === 'race') await sceneRace(tok, 1);
       if (name === 'race10') await sceneRace(tok, 10);
@@ -1213,7 +1635,7 @@
     } catch (e) {
       if (!(e instanceof Abort)) { console.error(e); say('Something went wrong', e.message, 'Check that the stack is up (<b>make up</b>) and press <b>Reset city</b>.'); }
     } finally {
-      if (tok === S.token && name !== 'happy') { S.running = false; setButtons(); $('#nextBtn').hidden = true; S.override.clear(); S.rideOverride = {}; }
+      if (tok === S.token && !PLAYERS[name]) { S.running = false; setButtons(); $('#nextBtn').hidden = true; S.override.clear(); S.rideOverride = {}; }
     }
   }
   function setButtons() { $$('[data-run]').forEach((b) => { b.disabled = S.running && b.dataset.run !== 'free'; }); }
@@ -1241,6 +1663,8 @@
 
   // ---------- boot ----------
   health();
+  getConfig();
+  setInterval(getConfig, 5000);
   poll().then(() => {
     const pts = [...S.drivers.values()].map((d) => [d.latitude, d.longitude]);
     if (pts.length) map.fitBounds(L.latLngBounds(pts).pad(0.3), { maxZoom: 15 });
