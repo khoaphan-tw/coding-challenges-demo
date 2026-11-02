@@ -4,3 +4,7 @@ providers:
     type: file
     options:
       path: /otel-lgtm/ridehail-dashboard.json
+  - name: "Load test (k6)"
+    type: file
+    options:
+      path: /otel-lgtm/ridehail-loadtest.json

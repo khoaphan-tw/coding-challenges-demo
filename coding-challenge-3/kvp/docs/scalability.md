@@ -91,6 +91,13 @@ The topics are the ones challenge §5 asks about.
 | **T4** | At-least-once + idempotent consumers | "Exactly-once" (Kafka transactions / 2PC) | Simple, broker-agnostic, crash-safe | Inbox/outbox tables and cleanup | Never: the DB write is outside Kafka anyway ([ADR-004](adr/ADR-004-messaging-outbox-inbox.md)) |
 | **T5** | Location in Postgres per update (stage 1) | Stream-only location | Auditable, simple, one source of truth | Write amplification (B1) | ~50k drivers (S1) |
 
-## 7. What is not measured
+## 7. Measured results
 
-We did **not** run load tests. The per-node limits above (Postgres ~10–20k simple writes/s, Redis ~100k+ ops/s per core) are typical published orders of magnitude, not measurements of this system. The next step would be k6 scenarios for location ingestion and hot-zone contention ([ADR-011](adr/ADR-011-testing-strategy.md)).
+First load tests (k6 → Grafana, 1,000-driver topology on one shared 4-vCPU VM) are in [load-test-report.md](load-test-report.md); scripts in [loadtest/](../loadtest/README.md). Headlines:
+
+* **New bottleneck G1, the nginx gateway**: `502` from ~1,000 req/s (no upstream keepalive, 1,024 worker connections) while the services were idle. Verified fix: upstream keepalive and more worker connections.
+* **B1/B4 confirmed in shape**: location writes are clean up to ~1,000 req/s (≈ 4,000 drivers), then latency climbs to seconds and the outbox backlog reaches 114k rows. The "~50–100k drivers" estimate was not reproduced on the shared VM; re-measure on dedicated infrastructure before moving the S1 trigger.
+* **B3 confirmed**: with 8 drivers in one area, conflicts / offers went 8 % → 292 % → 555 % while every container stayed under 40 % CPU and HTTP errors stayed at 0.
+* A larger DB pool (4 → 24) did not help.
+
+Still **not measured**: replicas, a multi-node broker, sharding, the gRPC location stream, and B2/B5/B6. The per-node limits in §4 for those remain typical published orders of magnitude.

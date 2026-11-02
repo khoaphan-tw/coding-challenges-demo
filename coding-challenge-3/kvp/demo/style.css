@@ -294,6 +294,7 @@ body.dark-map .leaflet-tile-pane { filter: invert(1) hue-rotate(185deg) brightne
 .lk-grafana i { background: #f97316; }
 .lk-redpanda i { background: #ef4444; color: #fff; }
 .lk-db i { background: #38bdf8; }
+.lk-redis i { background: #dc382d; color: #fff; }
 .lk a { font: 500 11.5px var(--mono); padding: 2px 7px; border-radius: 5px; border: 1px solid var(--line); color: var(--text); background: var(--bg); }
 .lk a:hover { border-color: var(--accent); text-decoration: none; color: var(--accent); }
 .cap-detail { margin: 8px 0 0; max-height: 170px; overflow: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; font: 11px/1.45 var(--mono); color: #c9d4ea; white-space: pre; }

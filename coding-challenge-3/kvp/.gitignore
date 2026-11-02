@@ -44,3 +44,6 @@ tmp/
 # --- OS ---
 .DS_Store
 Thumbs.db
+
+# k6 raw results (summary.json, k6.log, stats.csv): regenerate with make load-*; conclusions are in docs/load-test-report.md
+loadtest/results/

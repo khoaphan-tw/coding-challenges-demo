@@ -80,6 +80,7 @@ services:
     ports: ["3000:3000", "4317:4317", "4318:4318"]
     volumes:
       - ./deploy/grafana/dispatch-overview.json:/otel-lgtm/ridehail-dashboard.json:ro
+      - ./deploy/grafana/loadtest.json:/otel-lgtm/ridehail-loadtest.json:ro
       - ./deploy/grafana/dashboards.yaml:/otel-lgtm/grafana/conf/provisioning/dashboards/ridehail.yaml:ro
 
   # ---------- services ----------
@@ -120,6 +121,28 @@ services:
       redis: { condition: service_healthy }
       lgtm: { condition: service_started }
 
+  adminer: # DB browser for the map demo (dev only): http://localhost:8089
+    image: adminer:5.4.1
+    environment:
+      ADMINER_DEFAULT_SERVER: postgres
+      ADMINER_DESIGN: dracula
+    volumes:
+      - ./deploy/adminer/demo-autologin.php:/var/www/html/plugins-enabled/demo-autologin.php:ro
+    ports: ["8089:8080"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  redisinsight: # Redis browser for the map demo (dev only): http://localhost:5540
+    image: redislabs/redisinsight:3.8.0
+    environment:
+      RI_REDIS_HOST: redis          # preconfigured connection, no setup screen
+      RI_REDIS_PORT: "6379"
+      RI_REDIS_ALIAS: ridehail-redis
+      RI_ACCEPT_TERMS_AND_CONDITIONS: "true"
+    ports: ["5540:5540"]
+    depends_on:
+      redis: { condition: service_healthy }
+
   swagger-ui: # REST API documentation, served by the gateway at http://localhost:8080/docs/
     image: swaggerapi/swagger-ui:v5.17.14
     environment:
@@ -131,6 +154,7 @@ services:
     volumes:
       - ./deploy/nginx.conf:/etc/nginx/conf.d/default.conf:ro
       - ./api/openapi.yaml:/usr/share/nginx/api/openapi.yaml:ro
+      - ./demo:/usr/share/nginx/demo:ro
     ports: ["8080:8080", "9090:9090"] # REST (v1), gRPC (v2)
     depends_on:
       ride-service: { condition: service_healthy }
