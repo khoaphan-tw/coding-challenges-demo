@@ -800,7 +800,8 @@
   const LANES = ['Passenger', 'Driver', 'ride-svc', 'dispatch', 'Redis', 'driver-svc'];
   const [LP, LD, LRS, LXS, LR, LDS] = [0, 1, 2, 3, 4, 5];
   const HOST = location.hostname || 'localhost';
-  const TOOLS = { grafana: `http://${HOST}:3000`, redpanda: `http://${HOST}:8088`, db: `http://${HOST}:8089` };
+  const TOOLS = { grafana: `http://${HOST}:3000`, redpanda: `http://${HOST}:8088`, db: `http://${HOST}:8089`, redis: `http://${HOST}:5540` };
+  const RI_DB = '0'; // RedisInsight id of the database preconfigured by RI_REDIS_HOST (docker-compose.yml)
   const gExplore = (pane) => `${TOOLS.grafana}/explore?schemaVersion=1&orgId=1&panes=${encodeURIComponent(JSON.stringify({ a: pane }))}`;
   const gLogs = (c, svc) => gExplore({
     datasource: 'loki',
@@ -819,6 +820,10 @@
   const logs = (svc) => (c) => ['Grafana', `${svc ? svc.replace('-service', '') : 'all'} logs`, gLogs(c, svc)];
   const trace = (c) => ['Grafana', 'trace', gTrace(c)];
   const topic = (t, key = 'R1') => (c) => ['Redpanda', t, rp(t, c[key])];
+  // RedisInsight cannot deep-link to a key, so the button opens Workbench and copies the command to run.
+  const GEO = 'geo:drivers:available';
+  const redis = (label, cmd) => (c) => ['Redis', label, `${TOOLS.redis}/${RI_DB}/workbench`, cmd(c)];
+  const redisDriver = redis('driver hash + GEO', (c) => `HGETALL driver:${c.drv}\nGEOPOS ${GEO} ${c.drv}`);
   const table = (db, t, col, key, order) => (c) => ['DB', `${db.replace('_db', '')}.${t}`, adm(db, t, col, c[key], order)];
 
   const T = (c, at, from = c.T0, after = '') => (at && from ? `${after ? '+' : 'T+'}${Math.max(0, new Date(at) - new Date(from))} ms${after ? ' after ' + after : ''}` : '');
@@ -858,7 +863,7 @@
       text: () => 'Redis GEO suggests candidates; Haversine orders them by (distance, driverId). Offline and far drivers are out.',
       proof: (c) => `“${esc(stepOf(c, 'RESERVING').detail)}” → <b>${c.drv}</b>`, at: (c) => stepOf(c, 'RESERVING').at,
       detail: (c) => ({ saga: { radiusM: c.x1.saga.radiusM, pickup: c.x1.saga.pickup }, step: stepOf(c, 'RESERVING') }),
-      links: [table('dispatch_db', 'saga_steps', 'ride_id', 'R1', 'id'), logs('dispatch-service'), trace] },
+      links: [redis('GEOSEARCH 2 km', (c) => `GEOSEARCH ${GEO} FROMLONLAT ${c.x1.saga.pickup.longitude} ${c.x1.saga.pickup.latitude} BYRADIUS ${c.x1.saga.radiusM} m ASC WITHDIST WITHCOORD`), table('dispatch_db', 'saga_steps', 'ride_id', 'R1', 'id'), logs('dispatch-service'), trace] },
     { row: { f: LXS, t: LDS, txt: 'ReserveDriver(D001)', ac: 'AC-09', async: true },
       kicker: 'Step 6 · saga command', title: 'Ask driver-service to reserve D001',
       text: () => 'The saga goes to <b>RESERVING</b> and writes a <b>ReserveDriver</b> command to its outbox.',
@@ -870,7 +875,7 @@
       text: () => 'One conditional <b>UPDATE drivers SET status=\'OFFERED\' WHERE id=$1 AND status=\'AVAILABLE\'</b>. Had another ride won, 0 rows would change and the saga would try the next driver.',
       proof: (c) => `${c.drv} <b>AVAILABLE → OFFERED</b> · currentRideId <b>${ev(c.d1.currentRideId)}</b>`, at: (c) => c.d1.updatedAt,
       detail: (c) => c.d1,
-      links: [table('driver_db', 'drivers', 'id', 'drv'), topic('driver.events.v1', 'drv'), topic('dispatch.replies.v1'), logs('driver-service')] },
+      links: [table('driver_db', 'drivers', 'id', 'drv'), topic('driver.events.v1', 'drv'), topic('dispatch.replies.v1'), redisDriver, logs('driver-service')] },
     { row: { f: LXS, t: LXS, txt: '[tx] offer PENDING, expires +30 s', ac: 'AC-05' },
       kicker: 'Step 8 · AC-05 offer', title: 'A pending offer with a timeout',
       text: (c) => `Offer <b>PENDING</b>, expires in <b>${c.offerSecs ?? 30} s</b> (the ring on the driver). If nobody answers, a timeout counts as a rejection.`,
@@ -902,7 +907,7 @@
       text: () => 'Accepting moves the driver <b>OFFERED → BUSY</b>; a BUSY driver cannot receive offers or go offline.',
       proof: (c) => `${c.drv} <b>OFFERED → BUSY</b>`, at: (c) => c.d2.updatedAt, from: (c) => c.tAccept, after: 'accept',
       detail: (c) => c.d2,
-      links: [topic('driver.commands.v1'), table('driver_db', 'drivers', 'id', 'drv')] },
+      links: [topic('driver.commands.v1'), table('driver_db', 'drivers', 'id', 'drv'), redisDriver] },
     { row: { f: LXS, t: LRS, txt: 'MarkAccepted → DRIVER_ACCEPTED', ac: 'AC-06', async: true },
       kicker: 'Step 13 · AC-06', title: 'Ride DRIVER_ACCEPTED',
       text: () => 'ride-service applies <b>DRIVER_ASSIGNED → DRIVER_ACCEPTED</b>. A repeated accept would be a no-op (AC-08).',
@@ -914,7 +919,7 @@
       text: () => 'Every move is a real <b>PUT /drivers/D001/location</b>: latest location stored with a version, published as DriverLocationUpdated.',
       run: async (c, tok) => { await driveTrip(c.R1, tok, { complete: false, fast: true }); c.dTrip = (await api('GET', `/drivers/${c.drv}`, null, { quiet: true })).data; },
       detail: (c) => c.dTrip,
-      links: [topic('driver.events.v1', 'drv'), table('driver_db', 'drivers', 'id', 'drv'), () => ['Grafana', 'dashboard', gDash()]] },
+      links: [topic('driver.events.v1', 'drv'), table('driver_db', 'drivers', 'id', 'drv'), redisDriver, () => ['Grafana', 'dashboard', gDash()]] },
     { row: { f: LD, t: LRS, txt: 'POST /rides/R1/complete', ac: 'AC-06' },
       kicker: 'Step 14 · AC-06', title: 'Trip completed',
       text: () => '<b>COMPLETED</b> is a terminal state. ride-service publishes <b>RideCompleted</b> through its outbox.',
@@ -934,7 +939,7 @@
       text: (c) => `Request → offer → accept → complete across 3 services and Redpanda. Request to offer took <b>${c.toOffer} ms</b> of server time. Use <b>Prev</b> or click any arrow to revisit a step.`,
       proof: (c) => `${c.drv} <b>BUSY → AVAILABLE</b> · currentRideId <b>null</b>`, at: (c) => c.d3.updatedAt, from: (c) => c.tDone, after: 'complete',
       detail: (c) => c.d3,
-      links: [topic('driver.commands.v1'), table('driver_db', 'drivers', 'id', 'drv'), trace, logs(null)] },
+      links: [topic('driver.commands.v1'), table('driver_db', 'drivers', 'id', 'drv'), redisDriver, trace, logs(null)] },
   ];
 
   const H = { active: false, idx: -1, reached: -1, playing: false, busy: false, failed: false, c: {}, tok: 0, loop: 0, finish: null, layout: null };
@@ -995,6 +1000,11 @@
     $('#tab-seq').innerHTML = `<div class="sq-head">${head}</div>${rows}
       <div class="sq-foot">Same flow as <code>docs/sequence-diagram.md</code> §1. Dashed = async via Redpanda (outbox → topic → inbox). Click a lit arrow to revisit it.</div>`;
   }
+  $('#capLinks').addEventListener('click', (e) => {
+    const a = e.target.closest('a[data-cmd]'); if (!a) return;
+    navigator.clipboard?.writeText(a.dataset.cmd).catch(() => {});
+    toast('Copied for RedisInsight Workbench: paste (⌘V) and run (⌘/Ctrl+Enter). Shows Redis as it is now.');
+  });
   $('#tab-seq').addEventListener('click', (e) => {
     const row = e.target.closest('[data-step]');
     if (!row || !H.active) return;
@@ -1025,7 +1035,9 @@
     say(s.kicker, s.title, s.text(c));
     const links = ready ? s.links.map((f) => { try { return f(c); } catch { return null; } }).filter(Boolean) : [];
     const groups = {};
-    links.forEach(([tool, label, url]) => { (groups[tool] ||= []).push(`<a href="${esc(url)}" target="kvp-${tool.toLowerCase()}" rel="noopener">${esc(label)} ↗</a>`); });
+    links.forEach(([tool, label, url, copy]) => {
+      (groups[tool] ||= []).push(`<a href="${esc(url)}" target="kvp-${tool.toLowerCase()}" rel="noopener"${copy ? ` data-cmd="${esc(copy)}" title="Opens Workbench and copies:\n${esc(copy)}"` : ''}>${esc(label)} ${copy ? '⧉' : '↗'}</a>`);
+    });
     $('#capLinks').innerHTML = Object.entries(groups).map(([tool, as]) => `<span class="lk lk-${tool.toLowerCase()}"><i>${tool}</i>${as.join('')}</span>`).join('');
     let detail = null;
     if (ready && s.detail) { try { detail = s.detail(c); } catch { /* not recorded */ } }

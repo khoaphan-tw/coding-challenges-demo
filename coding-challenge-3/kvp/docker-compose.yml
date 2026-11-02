@@ -132,6 +132,17 @@ services:
     depends_on:
       postgres: { condition: service_healthy }
 
+  redisinsight: # Redis browser for the map demo (dev only): http://localhost:5540
+    image: redislabs/redisinsight:3.8.0
+    environment:
+      RI_REDIS_HOST: redis          # preconfigured connection, no setup screen
+      RI_REDIS_PORT: "6379"
+      RI_REDIS_ALIAS: ridehail-redis
+      RI_ACCEPT_TERMS_AND_CONDITIONS: "true"
+    ports: ["5540:5540"]
+    depends_on:
+      redis: { condition: service_healthy }
+
   swagger-ui: # REST API documentation, served by the gateway at http://localhost:8080/docs/
     image: swaggerapi/swagger-ui:v5.17.14
     environment:
