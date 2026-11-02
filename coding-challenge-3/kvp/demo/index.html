@@ -1,0 +1,152 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>KVP Dispatch Live</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="logo">KVP</span>
+      <div>
+        <div class="title">Dispatch Live</div>
+        <div class="sub">Real Go services · Redpanda saga · Postgres decides · Redis GEO suggests</div>
+      </div>
+    </div>
+    <div class="top-right">
+      <span id="health" class="health"><i></i><b>checking API…</b></span>
+      <a href="/docs/" target="_blank" rel="noopener">Swagger</a>
+      <a href="http://localhost:3000" target="_blank" rel="noopener">Grafana</a>
+      <a href="http://localhost:8088" target="_blank" rel="noopener">Redpanda</a>
+      <a href="http://localhost:8089/?pgsql=postgres&amp;username=postgres" target="_blank" rel="noopener">Database</a>
+    </div>
+  </header>
+
+  <main class="layout">
+    <!-- Left: scenes -->
+    <aside class="panel left">
+      <h2>Demo</h2>
+
+      <section class="scene hero" data-scene="happy">
+        <div class="tags"><span>AC-01</span><span>AC-02</span><span>AC-04</span><span>AC-05</span><span>AC-06</span><span>AC-10</span></div>
+        <h3>Happy path</h3>
+        <p>Request → offer → accept → complete, exactly as in <code>sequence-diagram.md</code> §1. Each of the 16 arrows lights up only when the API confirms it. Pause, step back and forth, and open each step in Grafana, Redpanda or the database.</p>
+        <button class="run" data-run="happy">▶ Run happy path</button>
+      </section>
+
+      <details class="more">
+        <summary>More scenarios (later)</summary>
+
+      <section class="scene" data-scene="match">
+        <div class="tags"><span>AC-04</span><span>AC-05</span><span>AC-07</span></div>
+        <h3>Nearest driver, reject, rematch</h3>
+        <p>2 km radius, offline and far drivers excluded. The nearest rejects, is excluded for good, and the next nearest drives the trip.</p>
+        <button class="run" data-run="match">▶ Run scene</button>
+      </section>
+
+      <section class="scene" data-scene="race">
+        <div class="tags"><span>AC-09</span></div>
+        <h3>The race for one driver</h3>
+        <p>Two passengers, same distance, same instant. One atomic SQL update decides. The loser gets the next driver.</p>
+        <div class="btn-row">
+          <button class="run" data-run="race">▶ Run once</button>
+          <button class="run ghost" data-run="race10">× 10 rounds</button>
+        </div>
+        <div class="score" id="raceScore" hidden>
+          <div><b id="rsRounds">0</b><span>rounds</span></div>
+          <div><b id="rsCollide">0</b><span>DB collisions</span></div>
+          <div class="ok"><b id="rsDouble">0</b><span>double-bookings</span></div>
+        </div>
+      </section>
+
+      <section class="scene" data-scene="storm">
+        <div class="tags"><span>AC-08</span><span>AC-01</span><span>AC-06</span></div>
+        <h3>Idempotency storm</h3>
+        <p>10 identical requests in parallel make 1 ride. A reused key with a new body is refused. 5 parallel accepts change state once.</p>
+        <button class="run" data-run="storm">▶ Run scene</button>
+        <div class="score" id="stormScore" hidden>
+          <div><b id="ssSent">0</b><span>requests</span></div>
+          <div><b id="ssReplay">0</b><span>replayed</span></div>
+          <div class="ok"><b id="ssRides">0</b><span>rides</span></div>
+        </div>
+      </section>
+
+      <section class="scene free" data-scene="free">
+        <div class="tags"><span>AC-02</span><span>AC-03</span><span>Free play</span></div>
+        <h3>Free play</h3>
+        <p>Click the map for pickup, then destination. Drag a driver to move it. Click a driver to switch it online or offline, or to answer its offer.</p>
+        <div class="btn-row">
+          <button class="run" data-run="free">Enter free play</button>
+          <button class="run ghost" id="requestBtn" disabled>Request ride</button>
+        </div>
+      </section>
+      </details>
+
+      <div class="controls">
+        <label class="switch"><input type="checkbox" id="stepMode"><span></span>Start paused</label>
+        <div class="keys"><kbd>Space</kbd> play/pause · <kbd>←</kbd><kbd>→</kbd> step · <kbd>Esc</kbd> stop</div>
+        <label class="switch"><input type="checkbox" id="darkMap" checked><span></span>Dark map</label>
+        <button class="ghost wide" id="resetBtn">↺ Reset city</button>
+      </div>
+
+      <div class="legend">
+        <div><i class="dot s-AVAILABLE"></i>AVAILABLE</div>
+        <div><i class="dot s-OFFERED"></i>OFFERED</div>
+        <div><i class="dot s-BUSY"></i>BUSY</div>
+        <div><i class="dot s-OFFLINE"></i>OFFLINE</div>
+        <div><i class="dot excl"></i>Excluded for this ride</div>
+      </div>
+    </aside>
+
+    <!-- Center: map -->
+    <section class="map-wrap">
+      <div id="map"></div>
+      <div class="caption" id="caption" hidden>
+        <div class="cap-kicker" id="capKicker"></div>
+        <div class="cap-title" id="capTitle"></div>
+        <div class="cap-text" id="capText"></div>
+        <div class="cap-links" id="capLinks"></div>
+        <pre class="cap-detail" id="capDetail" hidden></pre>
+        <div class="ctrl" id="ctrl" hidden>
+          <button class="ghost" id="cStop" title="Stop and cancel the ride (Esc)">■ Stop</button>
+          <button class="ghost" id="cPrev" title="Previous step (←)">◀ Prev</button>
+          <button id="cPlay" title="Play / pause (Space)">⏸ Pause</button>
+          <button class="ghost" id="cNext" title="Next step (→)">Next ▶</button>
+          <span class="pos" id="cPos"></span>
+          <span class="cwarn" id="cWarn"></span>
+          <button class="ghost" id="cDetail" title="Show the recorded API data for this step">{ } Details</button>
+        </div>
+        <button class="next" id="nextBtn" hidden>Next ›</button>
+      </div>
+      <div class="sql" id="sql" hidden></div>
+    </section>
+
+    <!-- Right: ride + stream -->
+    <aside class="panel right">
+      <h2>Ride</h2>
+      <div class="ride-card" id="rideCard">
+        <div class="muted">No ride yet. Run a scene.</div>
+      </div>
+
+      <div class="tabs">
+        <button class="tab active" data-tab="seq">Sequence</button>
+        <button class="tab" data-tab="events">Saga steps</button>
+        <button class="tab" data-tab="history">State history</button>
+        <button class="tab" data-tab="api">API calls <span id="apiCount">0</span></button>
+      </div>
+      <div class="stream" id="tab-seq"><div class="muted">Run the happy path to watch the sequence diagram fill in with live evidence.</div></div>
+      <div class="stream" id="tab-events" hidden><div class="muted">Dispatch steps from <code>GET /rides/{id}/dispatch</code> appear here.</div></div>
+      <div class="stream" id="tab-history" hidden><div class="muted">Transitions from <code>GET /rides/{id}/history</code> appear here.</div></div>
+      <div class="stream mono" id="tab-api" hidden></div>
+    </aside>
+  </main>
+
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
