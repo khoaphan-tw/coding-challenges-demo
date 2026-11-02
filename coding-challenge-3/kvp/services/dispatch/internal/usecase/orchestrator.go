@@ -28,9 +28,13 @@ type Orchestrator struct {
 	Publisher  Publisher
 	Inbox      Inbox
 
-	RadiusM       float64       // default 2000
-	OfferTimeout  time.Duration // default 30s
+	RadiusM       float64       // default 2000; fallback when Live is nil
+	OfferTimeout  time.Duration // default 30s; fallback when Live is nil
 	RetryInterval time.Duration // WAITING_FOR_DRIVER retry, default 10s
+
+	// Live, when set, supplies the radius and offer timeout at runtime
+	// (Redis hash config:dispatch, see LiveSettings).
+	Live SettingsSource
 
 	offers       metric.Int64Counter
 	matchLatency metric.Float64Histogram
@@ -52,6 +56,19 @@ func (o *Orchestrator) Init() *Orchestrator {
 	o.matchLatency, _ = m.Float64Histogram("dispatch_match_duration_seconds",
 		metric.WithDescription("Ride requested to offer created"), metric.WithUnit("s"))
 	return o
+}
+
+// SettingsSource returns the dispatch settings in force now.
+type SettingsSource interface {
+	Current(ctx context.Context) domain.Settings
+}
+
+// settings returns the radius and offer timeout in force now.
+func (o *Orchestrator) settings(ctx context.Context) domain.Settings {
+	if o.Live != nil {
+		return o.Live.Current(ctx)
+	}
+	return domain.Settings{MatchRadiusM: o.RadiusM, OfferTimeout: o.OfferTimeout}
 }
 
 func (o *Orchestrator) countOffer(ctx context.Context, outcome string) {
@@ -148,7 +165,7 @@ func (o *Orchestrator) HandleRideEvent(ctx context.Context, ev RideEvent) error 
 		return o.inTx(ctx, ev.EventID, func(ctx context.Context) error {
 			// ctx is already in the ride's trace (propagated through the event).
 			created, err := o.Sagas.Create(ctx, domain.Saga{RideID: ev.RideID, Status: domain.Started,
-				Pickup: ev.Pickup, RadiusM: o.RadiusM, TraceParent: obs.TraceParent(ctx)})
+				Pickup: ev.Pickup, RadiusM: o.settings(ctx).MatchRadiusM, TraceParent: obs.TraceParent(ctx)})
 			if err != nil {
 				return err
 			}
@@ -300,7 +317,8 @@ func (o *Orchestrator) onReserved(ctx context.Context, s domain.Saga, r Reply) e
 		}
 		return o.send(ctx, messaging.CmdReleaseDriver, s.RideID, r.DriverID, r.OfferID)
 	}
-	if err := o.Offers.Create(ctx, r.OfferID, s.RideID, r.DriverID, o.OfferTimeout); err != nil {
+	timeout := o.settings(ctx).OfferTimeout
+	if err := o.Offers.Create(ctx, r.OfferID, s.RideID, r.DriverID, timeout); err != nil {
 		if errors.Is(err, ErrDuplicatePendingOffer) { // defence in depth (ADR-002)
 			return fmt.Errorf("driver %s: %w", r.DriverID, err)
 		}
@@ -315,7 +333,7 @@ func (o *Orchestrator) onReserved(ctx context.Context, s domain.Saga, r Reply) e
 	}
 	o.countOffer(ctx, "created")
 	o.matchLatency.Record(ctx, time.Since(s.CreatedAt).Seconds())
-	if err := o.step(ctx, s, domain.Offered, fmt.Sprintf("offer created, driver has %s to respond", o.OfferTimeout),
+	if err := o.step(ctx, s, domain.Offered, fmt.Sprintf("offer created, driver has %s to respond", timeout),
 		r.DriverID, r.OfferID); err != nil {
 		return err
 	}

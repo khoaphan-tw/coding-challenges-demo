@@ -280,10 +280,21 @@ Which test proves which requirement: [requirements-traceability.md](requirements
 
 Set in [docker-compose.yml](../docker-compose.yml). The dispatch values can be overridden from the shell, e.g. `OFFER_TIMEOUT=5s make up`.
 
+**Live dispatch config (Redis).** `MATCH_RADIUS_M` and `OFFER_TIMEOUT` are written to the Redis hash `config:dispatch` when dispatch-service starts. Change them without a restart; every dispatch replica picks the change up within ~1 s (`SETTINGS_CACHE_TTL`). The radius applies to rides requested after the change, the timeout to offers created after it. A dispatch restart resets both to the env values.
+
+```bash
+make config                          # GET /dispatch/config
+make config-set RADIUS=1500 TIMEOUT=20
+docker compose exec redis redis-cli HSET config:dispatch offer_timeout_s 45   # or by hand
+```
+
+The map demo has the same controls (left panel, **Dispatch config**). Out-of-range values are refused (`422 INVALID_SETTINGS`: radius 100–50,000 m, timeout 1–3,600 s); invalid values written by hand are ignored and the env values are used.
+
 | Variable | Default | Service | Meaning |
 |---|---|---|---|
-| `MATCH_RADIUS_M` | `2000` | dispatch | Max pickup distance in metres |
+| `MATCH_RADIUS_M` | `2000` | dispatch | Max pickup distance in metres (seed of the live config) |
 | `OFFER_TIMEOUT` | `30s` | dispatch | Time a driver has to answer |
+| `SETTINGS_CACHE_TTL` | `1s` | dispatch | How long dispatch caches `config:dispatch` from Redis |
 | `DISPATCH_RETRY_INTERVAL` | `10s` | dispatch | Retry when no driver was available (also retried at once when any driver becomes available) |
 | `SWEEPER_INTERVAL` | `1s` | dispatch | How often expired offers are checked |
 | `SAGA_STUCK_AFTER` | `30s` | dispatch | Re-send the last command if a saga got no reply for this long |

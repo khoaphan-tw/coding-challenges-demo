@@ -260,6 +260,43 @@ paths:
         '204':
           description: No pending offer.
 
+  /dispatch/config:
+    get:
+      tags: [Offers]
+      operationId: getDispatchConfig
+      summary: Live matching radius and offer timeout
+      description: |
+        The values dispatch uses right now. They are stored in the Redis hash `config:dispatch`
+        (fields `match_radius_m`, `offer_timeout_s`), seeded from `MATCH_RADIUS_M` / `OFFER_TIMEOUT`
+        on start. `source` is `default` when Redis is unreachable or holds invalid values.
+      responses:
+        '200':
+          description: The live config.
+          content: { application/json: { schema: { $ref: '#/components/schemas/DispatchConfig' } } }
+    put:
+      tags: [Offers]
+      operationId: updateDispatchConfig
+      summary: Change the matching radius and/or the offer timeout
+      description: |
+        Writes `config:dispatch` in Redis; every dispatch replica picks it up within ~1 s.
+        The radius applies to rides requested after the change (a ride keeps the radius it
+        started with); the timeout applies to offers created after the change. Omitted fields
+        keep their value. A dispatch restart resets both to the env values.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DispatchConfigUpdate' }
+            example: { matchRadiusM: 1500, offerTimeoutSeconds: 20 }
+      responses:
+        '200':
+          description: The config after the change.
+          content: { application/json: { schema: { $ref: '#/components/schemas/DispatchConfig' } } }
+        '400': { $ref: '#/components/responses/InvalidJson' }
+        '422':
+          description: '`INVALID_SETTINGS`: radius outside 100–50,000 m or timeout outside 1–3,600 s.'
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+
   /healthz:
     get:
       tags: [System]
@@ -322,6 +359,20 @@ components:
       content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
 
   schemas:
+    DispatchConfig:
+      type: object
+      required: [matchRadiusM, offerTimeoutSeconds, source, redisKey]
+      properties:
+        matchRadiusM: { type: number, example: 2000, description: Maximum pickup distance in metres (AC-04). }
+        offerTimeoutSeconds: { type: number, example: 30, description: Time a driver has to answer an offer (AC-05). }
+        source: { type: string, enum: [redis, default], description: '`default` when Redis could not be used.' }
+        redisKey: { type: string, example: 'config:dispatch', description: The Redis hash that holds the values. }
+    DispatchConfigUpdate:
+      type: object
+      additionalProperties: false
+      properties:
+        matchRadiusM: { type: number, minimum: 100, maximum: 50000, example: 1500 }
+        offerTimeoutSeconds: { type: number, minimum: 1, maximum: 3600, example: 20 }
     Point:
       type: object
       required: [latitude, longitude]
@@ -499,4 +550,5 @@ components:
             - OFFER_NOT_CURRENT
             - OFFER_EXPIRED
             - SAGA_NOT_FOUND
+            - INVALID_SETTINGS
         detail: { type: string }

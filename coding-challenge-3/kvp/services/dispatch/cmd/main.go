@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"strconv"
@@ -28,6 +29,7 @@ import (
 	dmsg "ridehail/services/dispatch/internal/adapter/messaging"
 	"ridehail/services/dispatch/internal/adapter/postgres"
 	"ridehail/services/dispatch/internal/adapter/redis"
+	"ridehail/services/dispatch/internal/domain"
 	"ridehail/services/dispatch/internal/usecase"
 )
 
@@ -40,7 +42,16 @@ func main() {
 		sagas := &postgres.Sagas{Pool: rt.Pool}
 
 		// Use cases.
+		// Radius and offer timeout live in Redis (config:dispatch) so they can be
+		// changed at runtime; the env values are written there on start.
 		radius, _ := strconv.ParseFloat(svc.Env("MATCH_RADIUS_M", "2000"), 64)
+		offerTimeout := svc.Duration("OFFER_TIMEOUT", 30*time.Second)
+		live := &usecase.LiveSettings{Store: &redis.SettingsStore{R: rdb},
+			Defaults: domain.Settings{MatchRadiusM: radius, OfferTimeout: offerTimeout},
+			TTL:      svc.Duration("SETTINGS_CACHE_TTL", time.Second)}
+		if err := live.Defaults.Validate(); err != nil {
+			return fmt.Errorf("MATCH_RADIUS_M / OFFER_TIMEOUT: %w", err)
+		}
 		orch := (&usecase.Orchestrator{
 			Tx:            pgutil.TxManager{Pool: rt.Pool},
 			Sagas:         sagas,
@@ -50,14 +61,15 @@ func main() {
 			Publisher:     broker.Publisher{},
 			Inbox:         broker.Inbox{Consumer: dmsg.ConsumerName},
 			RadiusM:       radius,
-			OfferTimeout:  svc.Duration("OFFER_TIMEOUT", 30*time.Second),
+			OfferTimeout:  offerTimeout,
+			Live:          live,
 			RetryInterval: svc.Duration("DISPATCH_RETRY_INTERVAL", 10*time.Second),
 		}).Init()
 		proj := &usecase.Projection{Index: index, OnAvailable: orch.WakeWaiting,
 			Directory: &driverclient.Client{BaseURL: svc.Env("DRIVER_SERVICE_URL", "http://localhost:8082")}}
 
 		// Driving adapters: HTTP.
-		(&dhttp.Handler{Orchestrator: orch, Projection: proj, Ready: func(ctx context.Context) error {
+		(&dhttp.Handler{Orchestrator: orch, Projection: proj, Settings: live, Ready: func(ctx context.Context) error {
 			if err := rt.Pool.Ping(ctx); err != nil {
 				return err
 			}
@@ -76,6 +88,20 @@ func main() {
 		rt.Consume(dmsg.ConsumerName+"-geo", []string{messaging.TopicDriverEvents}, h.DriverEvent)
 
 		// Driving adapters: background workers.
+		rt.Go("settings seed", func(ctx context.Context) error {
+			for { // Redis may still be starting; until then the defaults are used
+				err := live.Seed(ctx)
+				if err == nil || ctx.Err() != nil {
+					return nil
+				}
+				slog.WarnContext(ctx, "settings seed failed, retrying", "error", err)
+				select {
+				case <-ctx.Done():
+					return nil
+				case <-time.After(3 * time.Second):
+				}
+			}
+		})
 		rt.Go("geo bootstrap", func(ctx context.Context) error {
 			for {
 				err := proj.RebuildIfEmpty(ctx)

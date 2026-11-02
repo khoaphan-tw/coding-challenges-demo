@@ -179,6 +179,8 @@ All traffic goes through the gateway: **REST (v1) on `:8080`** and **gRPC (v2) o
 | `POST /rides/{rideId}/offers/{driverId}/accept` | dispatch | `200 {offerId, status:"ACCEPTED"}` (repeat → `200` + `Idempotent-Replayed`) | `404 OFFER_NOT_FOUND`, `409 OFFER_NOT_CURRENT`, `409 OFFER_EXPIRED` | 05, 08 |
 | `POST /rides/{rideId}/offers/{driverId}/reject` | dispatch | `200 {status:"REJECTED"}` (repeat → `200`) | same as accept | 05, 07 |
 | `GET /rides/{rideId}/dispatch` | dispatch | `200` saga, offers, exclusions, steps | `404 SAGA_NOT_FOUND` | observability |
+| `GET /dispatch/config` | dispatch | `200 {matchRadiusM, offerTimeoutSeconds, source, redisKey}`: the live values from Redis `config:dispatch` | — | 04, 05 |
+| `PUT /dispatch/config` `{"matchRadiusM"?, "offerTimeoutSeconds"?}` | dispatch | `200` new config; used by new rides (radius) and new offers (timeout) within ~1 s | `400 INVALID_JSON`, `422 INVALID_SETTINGS` | 04, 05 |
 
 **Accept is synchronous on the offer and eventual on the ride.** `200 ACCEPTED` means the offer row changed (the pivot). The ride shows `DRIVER_ACCEPTED` and the driver `BUSY` a few milliseconds later, once the saga's commands are processed.
 
