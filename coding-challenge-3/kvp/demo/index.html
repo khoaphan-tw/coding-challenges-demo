@@ -40,6 +40,21 @@
         <button class="run" data-run="happy">▶ Run happy path</button>
       </section>
 
+      <section class="scene hero" data-scene="race">
+        <div class="tags"><span>AC-09</span><span>AC-04</span></div>
+        <h3>Two rides race for one driver</h3>
+        <p>§4 of <code>sequence-diagram.md</code>. Two passengers, same distance, same instant: both sagas pick D001 from Redis, and one conditional SQL update decides. The loser moves on to the next driver.</p>
+        <div class="btn-row">
+          <button class="run" data-run="race">▶ Run step by step</button>
+          <button class="run ghost" data-run="race10" title="Auto-play 10 races and count collisions">× 10 rounds</button>
+        </div>
+        <div class="score" id="raceScore" hidden>
+          <div><b id="rsRounds">0</b><span>rounds</span></div>
+          <div><b id="rsCollide">0</b><span>DB collisions</span></div>
+          <div class="ok"><b id="rsDouble">0</b><span>double-bookings</span></div>
+        </div>
+      </section>
+
       <details class="more">
         <summary>More scenarios (later)</summary>
 
@@ -48,21 +63,6 @@
         <h3>Nearest driver, reject, rematch</h3>
         <p>2 km radius, offline and far drivers excluded. The nearest rejects, is excluded for good, and the next nearest drives the trip.</p>
         <button class="run" data-run="match">▶ Run scene</button>
-      </section>
-
-      <section class="scene" data-scene="race">
-        <div class="tags"><span>AC-09</span></div>
-        <h3>The race for one driver</h3>
-        <p>Two passengers, same distance, same instant. One atomic SQL update decides. The loser gets the next driver.</p>
-        <div class="btn-row">
-          <button class="run" data-run="race">▶ Run once</button>
-          <button class="run ghost" data-run="race10">× 10 rounds</button>
-        </div>
-        <div class="score" id="raceScore" hidden>
-          <div><b id="rsRounds">0</b><span>rounds</span></div>
-          <div><b id="rsCollide">0</b><span>DB collisions</span></div>
-          <div class="ok"><b id="rsDouble">0</b><span>double-bookings</span></div>
-        </div>
       </section>
 
       <section class="scene" data-scene="storm">
