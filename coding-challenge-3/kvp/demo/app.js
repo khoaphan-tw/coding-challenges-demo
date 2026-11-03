@@ -1009,10 +1009,30 @@
     $('#tab-seq').innerHTML = `<div class="sq-head">${head}</div>${rows}
       <div class="sq-foot">Same flow as <code>docs/sequence-diagram.md</code> ${H.sc.ref}. Dashed = async via Redpanda (outbox → topic → inbox). Click a lit arrow to revisit it; <b>trace ↗</b> opens the ride's full trace in Grafana.</div>`;
   }
-  $('#capLinks').addEventListener('click', (e) => {
+  // Redis buttons: run the command through RedisInsight's own API (it saves it in Workbench history),
+  // then open Workbench so the result is already there. The result is also shown under Details.
+  const fmtRedis = (v, pad = '') => (Array.isArray(v) ? (v.length ? v.map((x, i) => `${pad}${i + 1}) ${Array.isArray(x) ? '\n' + fmtRedis(x, pad + '   ') : x ?? '(nil)'}`).join('\n') : `${pad}(empty)`) : `${pad}${v ?? '(nil)'}`);
+  $('#capLinks').addEventListener('click', async (e) => {
     const a = e.target.closest('a[data-cmd]'); if (!a) return;
+    e.preventDefault();
+    const cmds = a.dataset.cmd.split('\n').filter(Boolean);
     navigator.clipboard?.writeText(a.dataset.cmd).catch(() => {});
-    toast('Copied for RedisInsight Workbench: paste (⌘V) and run (⌘/Ctrl+Enter). Shows Redis as it is now.');
+    const w = window.open('', a.target); // open now (inside the click) so the popup is not blocked
+    try {
+      const r = await fetch(`${TOOLS.redis}/api/databases/${RI_DB}/workbench/command-executions`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ commands: cmds, mode: 'ASCII', resultsMode: 'DEFAULT', type: 'WORKBENCH' }),
+      });
+      if (!r.ok) throw new Error(`RedisInsight → ${r.status}`);
+      const runs = await r.json();
+      const d = $('#capDetail');
+      d.textContent = runs.map((x) => `> ${x.command}\n${x.result.map((y) => (y.status === 'success' ? fmtRedis(y.response) : `(error) ${y.response}`)).join('\n')}`).join('\n\n');
+      d.hidden = false; $('#cDetail').classList.add('on');
+      toast('Ran in RedisInsight Workbench (expand the row there). Result also under Details. This is Redis now, not at this step.');
+    } catch {
+      toast('Could not run it in RedisInsight. The command is copied: paste (⌘V) in Workbench and run (⌘/Ctrl+Enter).', true);
+    }
+    if (w) w.location.href = a.href; else window.open(a.href, a.target);
   });
   $('#tab-seq').addEventListener('click', (e) => {
     if (e.target.closest('a')) return; // a trace link, not a step change
