@@ -36,23 +36,31 @@
       <section class="scene hero" data-scene="happy">
         <div class="tags"><span>AC-01</span><span>AC-02</span><span>AC-04</span><span>AC-05</span><span>AC-06</span><span>AC-10</span></div>
         <h3>Happy path</h3>
-        <p>Request → offer → accept → complete, exactly as in <code>sequence-diagram.md</code> §1. Each of the 16 arrows lights up only when the API confirms it. Pause, step back and forth, and open each step in Grafana, Redpanda, the database or Redis.</p>
+        <p>Request → offer → accept → complete, exactly as in <code>sequence-diagram.md</code> §1. Each of the 16 arrows lights up only when the API confirms it. Pause, step back and forth, and open each step in Grafana (full trace on every step), Redpanda, the database or Redis.</p>
         <button class="run" data-run="happy">▶ Run happy path</button>
       </section>
 
-      <section class="scene hero" data-scene="race">
-        <div class="tags"><span>AC-09</span><span>AC-04</span></div>
-        <h3>Two rides race for one driver</h3>
-        <p>§4 of <code>sequence-diagram.md</code>. Two passengers, same distance, same instant: both sagas pick D001 from Redis, and one conditional SQL update decides. The loser moves on to the next driver.</p>
-        <div class="btn-row">
-          <button class="run" data-run="race">▶ Run step by step</button>
-          <button class="run ghost" data-run="race10" title="Auto-play 10 races and count collisions">× 10 rounds</button>
-        </div>
-        <div class="score" id="raceScore" hidden>
-          <div><b id="rsRounds">0</b><span>rounds</span></div>
-          <div><b id="rsCollide">0</b><span>DB collisions</span></div>
-          <div class="ok"><b id="rsDouble">0</b><span>double-bookings</span></div>
-        </div>
+      <div class="group-h">Sequence diagrams, step by step</div>
+
+      <section class="scene seq" data-scene="seqReject">
+        <div class="tags"><span>§2</span><span>AC-05</span><span>AC-06</span><span>AC-07</span></div>
+        <h3>Reject → rematch</h3>
+        <p>D001 rejects: excluded for this ride forever, released, ride back to MATCHING. The saga searches again and offers D002.</p>
+        <button class="run" data-run="seqReject">▶ Run §2</button>
+      </section>
+
+      <section class="scene seq" data-scene="seqRace">
+        <div class="tags"><span>§4</span><span>AC-09</span></div>
+        <h3>Two rides, one driver</h3>
+        <p>Two rides want D001 at the same instant. One conditional UPDATE wins; the other gets 0 rows and takes the next driver.</p>
+        <button class="run" data-run="seqRace">▶ Run §4</button>
+      </section>
+
+      <section class="scene seq" data-scene="seqCancel">
+        <div class="tags"><span>§6</span><span>AC-05</span><span>AC-06</span></div>
+        <h3>Cancel vs accept</h3>
+        <p>The passenger cancels while the driver accepts. Whatever order wins, the end state is the same: ride CANCELLED, driver AVAILABLE.</p>
+        <button class="run" data-run="seqCancel">▶ Run §6</button>
       </section>
 
       <details class="more">
@@ -63,6 +71,21 @@
         <h3>Nearest driver, reject, rematch</h3>
         <p>2 km radius, offline and far drivers excluded. The nearest rejects, is excluded for good, and the next nearest drives the trip.</p>
         <button class="run" data-run="match">▶ Run scene</button>
+      </section>
+
+      <section class="scene" data-scene="race">
+        <div class="tags"><span>AC-09</span></div>
+        <h3>The race for one driver</h3>
+        <p>Two passengers, same distance, same instant. One atomic SQL update decides. The loser gets the next driver.</p>
+        <div class="btn-row">
+          <button class="run" data-run="race">▶ Run once</button>
+          <button class="run ghost" data-run="race10">× 10 rounds</button>
+        </div>
+        <div class="score" id="raceScore" hidden>
+          <div><b id="rsRounds">0</b><span>rounds</span></div>
+          <div><b id="rsCollide">0</b><span>DB collisions</span></div>
+          <div class="ok"><b id="rsDouble">0</b><span>double-bookings</span></div>
+        </div>
       </section>
 
       <section class="scene" data-scene="storm">
@@ -87,6 +110,15 @@
         </div>
       </section>
       </details>
+
+      <div class="cfg">
+        <div class="cfg-h">Dispatch config <span id="cfgSrc">Redis · config:dispatch</span></div>
+        <div class="cfg-row">
+          <label>Radius <input id="cfgRadius" type="number" min="100" max="50000" step="100" value="2000"> m</label>
+          <label>Offer <input id="cfgTimeout" type="number" min="1" max="3600" step="1" value="30"> s</label>
+          <button class="ghost" id="cfgSave" title="PUT /dispatch/config: stored in Redis, used by new rides and offers">Save</button>
+        </div>
+      </div>
 
       <div class="controls">
         <label class="switch"><input type="checkbox" id="stepMode"><span></span>Start paused</label>

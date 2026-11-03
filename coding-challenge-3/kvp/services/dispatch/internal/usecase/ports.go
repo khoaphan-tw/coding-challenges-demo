@@ -71,21 +71,16 @@ type ExclusionRepository interface {
 	List(ctx context.Context, rideID string) (map[string]string, error) // driverId → reason
 }
 
+// SettingsStore holds the live dispatch settings (Redis hash config:dispatch).
+type SettingsStore interface {
+	// Load returns the stored settings; found=false when nothing is stored.
+	Load(ctx context.Context) (s domain.Settings, found bool, err error)
+	Save(ctx context.Context, s domain.Settings) error
+}
+
 // CandidateSource finds AVAILABLE drivers near a pickup, nearest first (Redis GEO).
 type CandidateSource interface {
 	Candidates(ctx context.Context, pickup geo.Point, radiusM float64, count int) ([]domain.Candidate, error)
-}
-
-// RadiusProvider supplies the current max pickup distance. It is read when a
-// saga is created, so a changed value applies to new rides without a restart.
-type RadiusProvider interface {
-	Radius(ctx context.Context) (float64, error)
-}
-
-// OfferTimeoutProvider supplies how long a driver has to answer an offer. It is
-// read when an offer is created, so a changed value applies to new offers.
-type OfferTimeoutProvider interface {
-	OfferTimeout(ctx context.Context) (time.Duration, error)
 }
 
 // GeoIndex is the writable side of the driver projection (Redis GEO).

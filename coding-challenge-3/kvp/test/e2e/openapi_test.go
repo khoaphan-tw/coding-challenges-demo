@@ -125,6 +125,12 @@ func TestRESTResponsesMatchOpenAPI(t *testing.T) {
 	c.call(200, "PUT", "/drivers/"+other+"/location", a.at(4100))
 	c.call(422, "PUT", "/drivers/"+other+"/location", point{95, 0})
 
+	// Dispatch config (Redis): write back the same values, so parallel tests are not affected.
+	cfg := c.call(200, "GET", "/dispatch/config", nil)
+	c.call(200, "PUT", "/dispatch/config", map[string]any{"matchRadiusM": cfg["matchRadiusM"], "offerTimeoutSeconds": cfg["offerTimeoutSeconds"]})
+	c.call(422, "PUT", "/dispatch/config", map[string]any{"matchRadiusM": 5})
+	c.call(400, "PUT", "/dispatch/config", map[string]any{"radius": 5})
+
 	// Ride lifecycle
 	eventually(t, 10*time.Second, rideIs(t, id, "DRIVER_ACCEPTED", driver))
 	c.call(200, "POST", "/rides/"+id+"/complete", nil)

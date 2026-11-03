@@ -1,18 +1,14 @@
-# 🚕 KVP: Ride-Hailing Dispatch Service
-
-> Coding Challenge #3 · Team KVP (Khoa · Vinh · Phuong)
->
-> *Finding the nearest driver is easy. Keeping every state correct while many requests and events run at the same time is the real challenge.*
+# 🚕 [Coding Challenge #3] KVP Team: Ride-Hailing Dispatch Service
 
 **Agenda**
 
 1. [Team introduction](#1-team-introduction)
-2. [The problem](#2-the-problem-coding-challenge-3)
-3. [Architecture: what we built](#3-architecture-what-we-built-to-solve-it)
-4. [How to run and test](#4-how-to-run-and-how-to-test)
-5. [Happy path scenario](#5-happy-path-scenario)
-6. [Scale](#6-scale-from-1k-to-1m-drivers)
-7. [Bonus: what we added](#7-bonus-what-we-added-and-why)
+2. [The problem](#2-the-problem)
+3. [Architecture: what we built](#3-architecture-what-we-built)
+4. [How to run and test](#4-how-to-run-and-test)
+5. [🎬 Demo](#5--demo)
+6. [Scalability](#6-scalability)
+7. [How we solved each problem](#7-how-we-solved-each-problem)
 8. [Bottlenecks, strategies, trade-offs](#8-3-bottlenecks--3-scaling-strategies--2-trade-offs)
 9. [What we learned, discussion, conclusion](#9-what-we-learned-discussion-and-conclusion)
 
@@ -32,212 +28,424 @@
 | **Victor Nguyen** | Developer | victor.nguyen@thoughtworks.com |
 | **Duy Phuong Nguyen** | Developer | phuong.nguyen@thoughtworks.com |
 
-What we set out to do as a team:
-
-* Meet **all 10 acceptance criteria**, each traced to code and tests.
-* Use the challenge to **practise distributed-system patterns** (saga, outbox/inbox, atomic reservation, tracing), even though a modular monolith was allowed.
-* Explain **why** behind every choice: 12 ADRs, C4 diagrams, 8 sequence flows.
-
----
-
-## 2. The problem: Coding Challenge #3
-
-Build a simplified **ride-hailing dispatch service**: passengers request rides, the system offers each ride to a nearby driver, and the driver accepts or rejects.
-
-```
-Passenger ──Request Ride──► Ride Service ──Find nearby drivers──► Dispatch ──Offer──► Driver
-                                                                                       │
-                                                       Ride Accepted ◄──── Accept ─────┤
-                                         Find another driver (rematch) ◄── Reject ─────┘
-```
-
-### What the system must do
-
-1. Receive a ride request (with an `Idempotency-Key`).
-2. Find the **nearest available driver within 2 km** (ties → smallest `driverId`).
-3. Offer the ride; the driver **accepts or rejects** within **30 s**.
-4. On reject/timeout, **rematch**, never offering the same ride to that driver again.
-5. **Never assign one driver to two rides** at the same time.
-6. Handle **duplicate requests and events** safely.
-7. Keep a **valid lifecycle** for rides and drivers.
-
-### The two state machines
-
-```
-Ride:    REQUESTED ─► MATCHING ─► DRIVER_ASSIGNED ─► DRIVER_ACCEPTED ─► COMPLETED
-                         ▲               │
-                         └── reject / ───┘          (any non-terminal) ─► CANCELLED
-                             timeout
-
-Driver:  OFFLINE ⇄ AVAILABLE ─offer─► OFFERED ─accept─► BUSY ─complete─► AVAILABLE
-                       ▲                 │
-                       └─ reject/cancel ─┘
-```
-
-### The three hard parts
-
-| Hard part | Why it is hard | Acceptance criteria |
-|---|---|---|
-| **Nearest matching** | Must use the latest location, exclude rejected drivers, stay fast as the fleet grows | AC-03, AC-04, AC-07 |
-| **Lifecycle across components** | Ride, driver and offer must change together, with a timer, a loop and cancellations | AC-05, AC-06, AC-10 |
-| **Concurrency & duplicates** | Two rides can pick the same driver; accept can race timeout; messages arrive twice | AC-08, AC-09 |
-
-Scoring: Acceptance Criteria 35 · Architecture 20 · Distributed Systems & Concurrency 15 · Testing 15 · Scalability 5 · Observability 5 · Docs 5.
-
----
-
-## 3. Architecture: what we built to solve it
-
-**Three Go microservices**, one per aggregate, each with **its own database**, coordinated by an **orchestrated saga** over **Redpanda** (Kafka API). **PostgreSQL** is the source of truth, **Redis GEO** finds nearby drivers, **OpenTelemetry → Grafana** gives logs, traces and metrics. One command starts all 10 containers.
+### How we worked as a team
 
 ```mermaid
 flowchart LR
-    C([Passenger / Driver]) -->|REST :8080 / gRPC :9090| GW[nginx gateway]
+    A[🔍 Investigate<br/>the requirements] --> B[📚 Research<br/>the options]
+    B --> C[🗣️ Debate<br/>and decide]
+    C --> D[👥 Pair and<br/>build]
+    D --> E[✅ Review<br/>and verify]
+    E -->|new question| A
+```
+
+| Activity | What we did |
+|---|---|
+| 🔍 **Investigate the requirements** | Read the challenge line by line and turned every acceptance criterion into a checklist item. We listed the open questions (What happens to a rejected driver? What does "duplicate" mean for events, not only HTTP? What if a cancel and an accept arrive together?) and wrote down our assumptions instead of guessing silently. |
+| 📚 **Research** | Before choosing, we each looked into a different area: how ride-hailing companies match drivers, spatial indexes, distributed transactions, message brokers, and how to prove a race condition in a test. We brought back options, not answers. |
+| 🗣️ **Debate** | This is where the "thousands of debates" come from. Monolith or microservices? Redis or PostGIS? Choreography or orchestration? Lock or atomic update? Each debate ended with a written decision record (ADR) that says what we chose, what we gave up, and when we would change our mind. |
+| 👥 **Pairing** | We paired on the risky parts (the saga, the concurrency guard, the outbox) so at least two people understood each of them. Smaller, well-understood tasks were done alone and reviewed. |
+| 🗓️ **Meetings** | Short syncs to unblock and re-plan, and longer design sessions when a decision affected everyone. Every decision that came out of a meeting went into the docs the same day. |
+| ✅ **Verify** | "Done" meant a test proves it, not "it works on my machine". Each acceptance criterion is traced to the code and to a test that fails if it breaks. Victor load-tested the system with k6 to find where it breaks. |
+
+What we took away from working this way: **writing decisions down ended debates faster**, and pairing on the hard parts meant nobody owned a part of the system alone.
+
+---
+
+## 2. The problem
+
+### 2.1 The story
+
+> 📍 A passenger at the Opera House in Ho Chi Minh City taps **Request ride**.
+> Five drivers are online nearby. Who gets the ride? What if that driver says no, or doesn't answer?
+> What if two passengers want the same driver at the same moment? What if the phone sends the request three times?
+
+We had to build the **dispatch service** behind that button: a small system that is **correct today** and can **grow** to a million drivers.
+
+### 2.2 The flow
+
+```mermaid
+flowchart LR
+    P([🧍 Passenger]) -->|1 request ride| R[Ride]
+    R -->|2 find nearby drivers| M{{Matching<br/>nearest AVAILABLE<br/>within 2 km}}
+    M -->|3 offer| D([🚗 Driver])
+    D -->|4a accept| A[✅ Ride accepted]
+    D -->|4b reject / 30 s timeout| X[Exclude this driver<br/>for this ride]
+    X -->|5 rematch| M
+    M -->|nobody left| W[⏳ Wait in MATCHING]
+    A -->|6 trip| C[🏁 Completed]
+```
+
+### 2.3 What the system must guarantee
+
+| | Requirement | AC |
+|---|---|---|
+| 🆕 | Create a ride with an `Idempotency-Key`; validate passenger and coordinates | AC-01 |
+| 🟢 | Drivers switch `OFFLINE ⇄ AVAILABLE`; busy drivers cannot | AC-02 |
+| 📍 | Store the latest driver location; matching uses it | AC-03 |
+| 🎯 | Nearest `AVAILABLE` driver within a configurable radius (2 km); ties → smallest `driverId` | AC-04 |
+| 📨 | Offer the ride; only that driver answers; 30 s timeout = rejection | AC-05 |
+| 🔁 | An explicit ride lifecycle: valid transitions pass, invalid ones fail, duplicates are harmless | AC-06 |
+| 🚫 | A driver who rejects is never offered that ride again | AC-07 |
+| ♻️ | Duplicate requests and events never create duplicate effects | AC-08 |
+| 🔒 | One driver can never hold two rides at the same time | AC-09 |
+| 📬 | Dispatch is asynchronous (event-driven) | AC-10 |
+
+### 2.4 Two state machines
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Ride" as ride {
+      [*] --> REQUESTED
+      REQUESTED --> MATCHING
+      MATCHING --> DRIVER_ASSIGNED: offer
+      DRIVER_ASSIGNED --> MATCHING: reject / timeout
+      DRIVER_ASSIGNED --> DRIVER_ACCEPTED: accept
+      DRIVER_ACCEPTED --> COMPLETED
+      REQUESTED --> CANCELLED
+      MATCHING --> CANCELLED
+      DRIVER_ASSIGNED --> CANCELLED
+      DRIVER_ACCEPTED --> CANCELLED
+    }
+```
+
+```mermaid
+stateDiagram-v2
+    direction LR
+    state "Driver" as driver {
+      OFFLINE --> AVAILABLE: go online
+      AVAILABLE --> OFFLINE: go offline
+      AVAILABLE --> OFFERED: offer
+      OFFERED --> AVAILABLE: reject / timeout / cancel
+      OFFERED --> BUSY: accept
+      BUSY --> AVAILABLE: complete / cancel
+    }
+```
+
+### 2.5 Why it is hard
+
+| Hard part | Why |
+|---|---|
+| 🎯 **Matching** | Must use the latest location, skip excluded drivers and stay fast as the fleet grows |
+| 🔗 **One lifecycle, many records** | Ride, driver and offer change together, with a loop (rematch), a timer (30 s) and cancellation at any time |
+| ⚡ **Races and duplicates** | Two rides pick the same driver; accept races timeout; messages arrive twice |
+
+> **Finding the nearest driver is the easy part. Keeping every state correct while requests and events run at the same time is the real challenge.**
+
+Out of scope (as the challenge allows): payments, pricing, auth, registration, ETA, mobile apps, multi-region.
+
+---
+
+## 3. Architecture: what we built
+
+### 3.1 The big picture
+
+**Three Go services**, one per business area, each with **its own database**. They talk through **Redpanda** (Kafka API). **PostgreSQL** is the source of truth, **Redis** answers "who is nearby?" and holds the live dispatch config, and **OpenTelemetry → Grafana** shows logs, traces and metrics. `make up` starts all of it.
+
+```mermaid
+flowchart LR
+    C([Passenger / Driver apps]) -->|REST :8080<br/>gRPC :9090| GW[nginx gateway]
     GW --> RS[ride-service]
     GW --> DS[driver-service]
     GW --> XS[dispatch-service<br/>saga orchestrator]
     RS --- RDB[(ride_db)]
     DS --- DDB[(driver_db)]
     XS --- XDB[(dispatch_db)]
-    XS --- REDIS[(Redis GEO<br/>AVAILABLE drivers)]
+    XS --- REDIS[(Redis<br/>GEO index + config)]
     RS & DS & XS <-->|outbox → topics → inbox| RP{{Redpanda}}
-    RS & DS & XS -.OTLP.-> LGTM[Grafana LGTM<br/>Loki · Tempo · Prometheus]
+    RS & DS & XS -.OTLP.-> LGTM[Grafana<br/>Loki · Tempo · Prometheus]
 ```
 
-| Service | Owns | Solves |
+| Service | Owns | Main job | AC |
+|---|---|---|---|
+| **ride-service** | Rides, passengers, idempotency keys, ride history | The ride lifecycle | 01, 06, 08 |
+| **driver-service** | Driver status and location | The **atomic reservation** of a driver | 02, 03, 09 |
+| **dispatch-service** | Sagas, offers, exclusions, timeouts, GEO index, config | Matching and the whole dispatch flow | 04, 05, 07, 10 |
+
+### 3.2 Five ideas that hold it together
+
+| Idea | In one sentence |
+|---|---|
+| **Saga** | dispatch-service drives each ride step by step with commands; before the driver accepts, every step can be undone |
+| **Outbox + inbox** | A state change and its messages are saved in one transaction; a consumer skips messages it has already handled |
+| **Compare-and-set (CAS) in SQL** | `UPDATE … WHERE status='AVAILABLE'`: the number of changed rows decides who won |
+| **Redis suggests, Postgres decides** | Redis finds nearby drivers fast; Postgres confirms the pick |
+| **One trace per ride** | Every log line and span of a ride, across services and minutes, joins one trace |
+
+### 3.3 Data model (ERD)
+
+Three databases on one Postgres server locally, each with its own user, so a service can only touch its own data. There are **no foreign keys across databases**: services refer to each other's records by id and stay consistent through the saga.
+
+**ride_db** (ride-service)
+
+```mermaid
+erDiagram
+    passengers ||--o{ rides : requests
+    rides ||--o{ ride_transitions : "history of"
+    rides ||--o| idempotency_keys : "created by"
+    passengers {
+        text id PK "P001…P010 (seeded)"
+        text name
+    }
+    rides {
+        uuid id PK "UUIDv7"
+        text passenger_id FK
+        float pickup_lat "CHECK -90..90"
+        float pickup_lng "CHECK -180..180"
+        float dest_lat
+        float dest_lng
+        text status "CHECK 6 states"
+        text assigned_driver_id "id in driver_db"
+        uuid current_offer_id "id in dispatch_db"
+        bigint version
+        text trace_parent "the ride's trace"
+        timestamptz created_at
+        timestamptz updated_at
+    }
+    ride_transitions {
+        bigserial id PK
+        uuid ride_id FK
+        text from_status
+        text to_status
+        text action
+        text driver_id
+        uuid offer_id
+        text cause "event id or http call"
+        timestamptz at
+    }
+    idempotency_keys {
+        text key PK
+        text request_hash
+        uuid ride_id
+        int status_code
+        jsonb response "replayed as-is"
+        timestamptz created_at
+    }
+```
+
+**driver_db** (driver-service)
+
+```mermaid
+erDiagram
+    drivers {
+        text id PK "D001…D020 (seeded)"
+        text status "OFFLINE AVAILABLE OFFERED BUSY"
+        float lat
+        float lng
+        uuid current_ride_id "set iff OFFERED or BUSY"
+        bigint version "orders events for the GEO index"
+        timestamptz location_updated_at
+        timestamptz updated_at
+    }
+```
+
+**dispatch_db** (dispatch-service)
+
+```mermaid
+erDiagram
+    dispatch_sagas ||--o{ offers : makes
+    dispatch_sagas ||--o{ ride_exclusions : "never again"
+    dispatch_sagas ||--o{ saga_steps : "audit trail"
+    dispatch_sagas {
+        uuid ride_id PK "one saga per ride"
+        text status "8 saga states"
+        float pickup_lat
+        float pickup_lng
+        float radius_m "radius when the ride started"
+        text reserving_driver_id
+        uuid reserving_offer_id
+        uuid current_offer_id
+        int round
+        text_array round_skips "lost reservations this round"
+        timestamptz next_retry_at
+        bigint version
+        text trace_parent
+    }
+    offers {
+        uuid id PK
+        uuid ride_id FK
+        text driver_id
+        text status "PENDING ACCEPTED REJECTED EXPIRED CANCELLED"
+        timestamptz created_at
+        timestamptz expires_at "the 30 s timer"
+        timestamptz responded_at
+    }
+    ride_exclusions {
+        uuid ride_id PK
+        text driver_id PK
+        text reason "REJECTED or EXPIRED"
+    }
+    saga_steps {
+        bigserial id PK
+        uuid ride_id
+        text step
+        text detail
+        text driver_id
+        uuid offer_id
+        text event_id
+    }
+```
+
+**In every database:** `outbox(id, topic, msg_key, event_id UNIQUE, type, envelope, headers, published_at)` and `inbox(consumer, event_id) PRIMARY KEY`.
+
+### 3.4 Indexes and constraints: correctness lives in the schema
+
+| Where | Index / constraint | Why it exists |
 |---|---|---|
-| **ride-service** | Rides, passengers, idempotency keys, ride state machine, history | AC-01, AC-06, AC-08 |
-| **driver-service** | Driver status + location, driver state machine, the **atomic reservation** | AC-02, AC-03, AC-09 |
-| **dispatch-service** | Saga, offers, exclusions, 30 s timeouts, matching, Redis GEO projection | AC-04, AC-05, AC-07, AC-10 |
+| `drivers` | `CHECK ((status IN ('OFFERED','BUSY')) = (current_ride_id IS NOT NULL))` | A driver who holds a ride always says which one; a free driver never does |
+| `offers` | `UNIQUE (driver_id) WHERE status='PENDING'` | **At most one pending offer per driver** (AC-09, second line of defence) |
+| `offers` | `UNIQUE (ride_id) WHERE status='PENDING'` | At most one pending offer per ride |
+| `offers` | `(expires_at) WHERE status='PENDING'` | The timeout sweeper finds expired offers without scanning history |
+| `offers` | `(ride_id, created_at)` | All offers of a ride, in order |
+| `dispatch_sagas` | `PRIMARY KEY (ride_id)` | A duplicate `RideRequested` **cannot** start a second saga (AC-08) |
+| `dispatch_sagas` | `(status, updated_at) WHERE status NOT IN ('COMPLETED','CANCELLED')` | The retrier only scans active sagas |
+| `ride_exclusions` | `PRIMARY KEY (ride_id, driver_id)` | Exclusion is permanent and recorded once (AC-07) |
+| `idempotency_keys` | `PRIMARY KEY (key)` | A concurrent duplicate `POST /rides` waits on the key, then replays (AC-01, AC-08) |
+| `inbox` | `PRIMARY KEY (consumer, event_id)` | A redelivered message is skipped (AC-08, AC-10) |
+| `outbox` | `(id) WHERE published_at IS NULL` | The relay reads only unpublished rows, in order |
+| `outbox` | `UNIQUE (event_id)` | A message is stored once |
+| `ride_transitions`, `saga_steps` | `(ride_id, id)` | "What happened to ride X?" in one indexed read |
+| `rides` | `CHECK` on coordinates and status | Invalid data cannot be stored even by a bug |
 
-### The core ideas in one sentence each
+### 3.5 Redis keys
 
-| Idea | What it means | Solves |
+| Key | Type | Content | Written by |
+|---|---|---|---|
+| `geo:drivers:available` | GEO (sorted set) | Only `AVAILABLE` drivers and their location | Projector, from driver events |
+| `driver:{id}` | Hash | `status, lat, lng, version` (newer versions only) | Projector (Lua script) |
+| `config:dispatch` | Hash | `match_radius_m`, `offer_timeout_s` | dispatch on start, `PUT /dispatch/config`, or `HSET` by hand |
+
+### 3.6 Topics
+
+| Topic | Key | Carries |
 |---|---|---|
-| **Orchestrated saga** | dispatch-service drives each ride with commands; before the driver accepts, every step can be undone (release driver, unassign ride) | Lifecycle across 3 services, rematch loop, timer, cancel |
-| **Transactional outbox** | Messages are written in the *same* DB transaction as the state change, then relayed to Redpanda | No lost or phantom events |
-| **Inbox** | Each consumer records `(consumer, event_id)` in its transaction; copies are skipped | Duplicate delivery |
-| **Atomic reservation** | `UPDATE drivers … WHERE status='AVAILABLE'`; the row count decides the winner | One driver, one ride (AC-09) |
-| **Redis suggests, Postgres decides** | Redis GEO returns candidates fast; Postgres confirms the pick | Fast *and* correct matching |
-| **Clean Architecture** | domain → use cases (ports) → adapters, enforced by a test | Testable flows, swappable infrastructure |
+| `ride.events.v1` | `rideId` | RideRequested, RideCancelled, RideCompleted, … |
+| `ride.commands.v1` | `rideId` | StartMatching, AssignDriver, UnassignDriver, MarkAccepted |
+| `driver.commands.v1` | `driverId` | ReserveDriver, ReleaseDriver, MarkDriverBusy |
+| `driver.events.v1` | `driverId` | DriverStatusChanged, DriverLocationUpdated (versioned) |
+| `dispatch.replies.v1` | `rideId` | CommandSucceeded, CommandRejected, DriverReserved, DriverReservationFailed |
+| `<topic>.dlq` | same | Messages that failed 5 times |
 
-### Inside each service
+### 3.7 Inside each service
+
+Clean Architecture: dependencies point inward, and a test fails the build if they don't.
 
 ```
 services/<ride|driver|dispatch>/
-├── cmd/main.go           composition root: builds adapters, injects them into use cases
+├── cmd/main.go           wires adapters into use cases
 └── internal/
-    ├── domain/           entities + rules: state machines, matching (pure Go, no I/O)
-    ├── usecase/          application logic + ports.go (interfaces for DB, outbox, …)
-    └── adapter/          http · grpc · messaging (Kafka) · postgres · redis · driverclient
+    ├── domain/           state machines, matching, settings rules (pure Go, no I/O)
+    ├── usecase/          application logic + ports.go (interfaces)
+    └── adapter/          http · grpc · messaging · postgres · redis
 ```
 
-### How each acceptance criterion is met
+### 3.8 Every acceptance criterion, traced
 
-| AC | Requirement | How | Key proof |
-|---|---|---|---|
-| 01 | Create ride | `POST /rides` → `REQUESTED`, UUIDv7, validation, `Idempotency-Key` stored with the response | `TestConcurrentDuplicateCreationCreatesOneRide` |
-| 02 | Driver availability | `OFFLINE ⇄ AVAILABLE`; `OFFERED`/`BUSY` cannot go offline | `TestDriverStatusLifecycle` |
-| 03 | Driver location | Versioned events keep the GEO index on the latest location | `TestIndexKeepsOnlyLatestAvailableDrivers` |
-| 04 | Matching | Nearest `AVAILABLE` within 2 km, Haversine, tie → smallest id | `TestEquidistantPicksSmallestDriverID` |
-| 05 | Ride offer | Offer `PENDING` 30 s; only the offered driver can answer | `TestOnlyTheOfferedDriverCanRespond`, `TestOfferTimeoutRematches` |
-| 06 | State machine | Pure, table-driven; invalid → `409`; duplicates are no-ops | `TestInvalidTransitions` |
-| 07 | Rematching | Permanent per-ride exclusions | `TestRejectionRematchesAndExcludesTheDriverForever` |
-| 08 | Idempotency | Idempotency key, inbox, saga PK, idempotent state machines | `TestDuplicateRideRequestedStartsOneSaga` |
-| 09 | Concurrency | Atomic conditional update + partial unique indexes | `TestConcurrentReservationOnlyOneWins` (50 rounds) |
-| 10 | Event-driven | Outbox → Redpanda → saga; retries, DLQ, resume | `TestHappyPath`, crash drill |
+| AC | How | Proof (automated test) |
+|---|---|---|
+| 01 | `POST /rides` → `REQUESTED`, UUIDv7, validation, idempotency key stored with the response | `TestConcurrentDuplicateCreationCreatesOneRide` |
+| 02 | `OFFLINE ⇄ AVAILABLE`; `OFFERED`/`BUSY` cannot go offline | `TestDriverStatusLifecycle` |
+| 03 | Versioned events keep the GEO index on the latest location | `TestIndexKeepsOnlyLatestAvailableDrivers` |
+| 04 | Nearest `AVAILABLE` within the live radius, Haversine, tie → smallest id | `TestEquidistantPicksSmallestDriverID` |
+| 05 | Offer `PENDING` with the live timeout; only the offered driver answers | `TestOnlyTheOfferedDriverCanRespond`, `TestOfferTimeoutRematches` |
+| 06 | Pure state machines; invalid → `409`; duplicates are no-ops | `TestInvalidTransitions` |
+| 07 | Permanent per-ride exclusions | `TestRejectionRematchesAndExcludesTheDriverForever` |
+| 08 | Idempotency key, inbox, saga PK, idempotent state machines | `TestDuplicateRideRequestedStartsOneSaga` |
+| 09 | CAS update + partial unique indexes | `TestConcurrentReservationOnlyOneWins` (50 rounds) |
+| 10 | Outbox → Redpanda → saga; retries, DLQ, resume | `TestHappyPath`, crash drill |
 
 Full mapping: [requirements-traceability.md](../docs/requirements-traceability.md).
 
 ---
 
-## 4. How to run and how to test
+## 4. How to run and test
 
 ### Run
 
 ```bash
-# one-time (macOS)
-brew install colima docker docker-compose docker-buildx lazydocker go jq
+brew install colima docker docker-compose docker-buildx lazydocker go jq    # once
 colima start --cpu 4 --memory 8 --vm-type vz --vz-rosetta
 
 cd coding-challenge-3/kvp
-make up          # build + start 10 containers, waits until healthy
-make demo        # request → reject → rematch → accept → complete, duplicates, a race
+make up          # build + start everything, waits until healthy
+make demo-map    # the live map demo (section 5)
+make demo        # the same story as a logged curl script
 make down        # stop (make clean also deletes data)
 ```
 
 | Open | What |
 |---|---|
-| http://localhost:8080 | REST API v1 (gateway) |
+| http://localhost:8080/demo/ | **Live map demo** |
 | http://localhost:8080/docs/ | Swagger UI with "Try it out" |
-| localhost:9090 | gRPC API v2 (location stream, offer push) |
-| http://localhost:3000 | Grafana → *Dispatch overview* (logs, traces, metrics) |
-| http://localhost:8088 | Redpanda Console (topics, messages, consumer groups) |
+| http://localhost:3000 | Grafana: logs, traces, metrics, k6 dashboard |
+| http://localhost:8088 | Redpanda Console: topics and messages |
+| http://localhost:8089 · http://localhost:5540 | Database browser (Adminer) · RedisInsight |
 
-Seeded data: passengers `P001–P010`; drivers `D001–D010` `AVAILABLE` ~220 m apart near Ben Thanh market (HCMC); `D011–D020` `OFFLINE`.
+### Change the radius and timeout at runtime
+
+```bash
+make config                              # {"matchRadiusM":2000,"offerTimeoutSeconds":30,"source":"redis",…}
+make config-set RADIUS=1500 TIMEOUT=20   # stored in Redis config:dispatch, live within ~1 s
+```
 
 ### Test
 
-| Command | What runs | Count | Time |
+| Command | What runs | Count |
+|---|---|---|
+| `make lint` | golangci-lint + OpenAPI lint | — |
+| `make test` | Unit (state machines, matching, settings, use cases with fakes) + architecture rules | < 2 s |
+| `make test-int` | Integration on **real Postgres 18 / Redis 8** (testcontainers) | ~15 s |
+| `make test-e2e` | Through the gateway: REST, gRPC, OpenAPI contract, real 30 s timeout | ~40 s |
+| `make postman` | Postman via newman: one folder per AC (115 checks) | ~40 s |
+| `make load-location` · `load-dispatch` · `load-hotzone` | k6 load tests (section 6) | minutes |
+
+**CI:** GitHub Actions on every push: lint and tests in parallel, then the whole stack in Docker for e2e and Postman.
+
+---
+
+## 5. 🎬 Demo
+
+**The live map demo drives the real services.** Every marker, status and arrow comes from the API; nothing is faked. Each scenario follows one diagram from [sequence-diagram.md](../docs/sequence-diagram.md): an arrow lights up **only when the API confirms it**, and every step has:
+
+* a **`trace ↗` button** that opens the ride's **full trace in Grafana** (Tempo), from `POST /rides` to the last message;
+* links to the same moment in **Grafana logs**, **Redpanda** messages, the **database** rows and **Redis**;
+* **Prev / Next / Play**, so we can stop and explain any step.
+
+| | Scenario | Sequence diagram | Shows |
 |---|---|---|---|
-| `make lint` | golangci-lint (8 linters + 2 formatters) + OpenAPI lint | — | ~10 s |
-| `make test` | Unit (state machines, matching, use cases with fakes) + architecture rules | 32 | < 2 s |
-| `make test-int` | Integration on **real Postgres 18 / Redis 8** (testcontainers) | 23 | ~15 s |
-| `make test-e2e` | End-to-end through the gateway: REST, gRPC, OpenAPI contract, real 30 s timeout | 12 | ~40 s |
-| `make postman` | Postman via newman: happy path + one folder per AC | 56 requests / 115 checks | ~40 s |
+| 5.1 | Happy path | §1 | request → offer → accept → trip → complete |
+| 5.2 | Reject → rematch | §2 | exclusion forever, compensation, new query |
+| 5.3 | Two rides, one driver | §4 | the race, decided by one SQL statement |
+| 5.4 | Cancel vs accept | §6 | two people act at once; same end state |
 
-**CI:** GitHub Actions runs `lint` and `test` in parallel on every push, then starts the whole stack in Docker for e2e + Postman.
-
-### Investigate a ride
+How to read every step's evidence:
 
 ```bash
 make trace-ride RIDE=<rideId>     # the ride's state changes from all services, in order + Tempo link
-make trace-logs TRACE=<traceId>   # every log line of the journey, with bodies and message values
+make trace-logs TRACE=<traceId>   # every log line of the journey
 ```
 
 ---
 
-## 5. Happy path scenario
+### 5.1 Happy path
 
-### The story
+<p align="center"><img src="img/demo-happy-path.png" alt="Happy path in the live demo" width="900"></p>
 
-> Passenger **P001** at Ben Thanh market requests a ride to Tan Son Nhat. Driver **D001** is 0.8 km away, **D002** 1.5 km, **D003** 3.2 km. The system offers the ride to D001 (nearest, inside 2 km). D001 accepts, drives, and completes the trip. D001 becomes available again.
+**Story.** Passenger P001 at the Opera House requests a ride to Tan Dinh Church. D001 is 800 m away, D002 1.5 km, D003 2.5 km (outside), D011 is closer but offline. The ride is offered to D001, who accepts, drives there (the app sends its location every 2 s) and completes the trip.
 
-### Run it
+| AC | Input | Output |
+|---|---|---|
+| AC-01 | `POST /rides` + `Idempotency-Key`, P001, valid coordinates | `201`, new `rideId`, `REQUESTED`, `traceId` |
+| AC-10 | `RideRequested` through outbox → Redpanda | saga `STARTED`, ride `MATCHING` |
+| AC-04 | `GEOSEARCH` within the radius | D001 picked (nearest); D011 offline and D003 outside are skipped |
+| AC-09 | `ReserveDriver(D001)` | `UPDATE … WHERE status='AVAILABLE'` → 1 row, D001 `OFFERED` |
+| AC-05 | Offer created | `PENDING`, expires in 30 s, ride `DRIVER_ASSIGNED` |
+| AC-05 | `POST …/offers/D001/accept` | `200 ACCEPTED`, ride `DRIVER_ACCEPTED`, D001 `BUSY` |
+| AC-03 | `PUT /drivers/D001/location` every 2 s during the trip | latest location stored with a new version |
+| AC-06 | `POST /rides/{id}/complete` | `COMPLETED` (terminal), D001 `AVAILABLE` |
 
-```bash
-# 1. passenger requests a ride
-curl -s -X POST localhost:8080/rides -H 'Idempotency-Key: k1' \
-  -d '{"passengerId":"P001","pickup":{"latitude":10.7769,"longitude":106.7009},
-       "destination":{"latitude":10.8231,"longitude":106.6297}}'
-# → 201 {"rideId":"<R1>","status":"REQUESTED"}
-
-# 2. a moment later the ride is offered to the nearest driver
-curl -s localhost:8080/rides/<R1>                  # → DRIVER_ASSIGNED, assignedDriverId D001
-
-# 3. driver sees and accepts the offer
-curl -s localhost:8080/drivers/D001/offer          # → {offerId, rideId, expiresAt}
-curl -s -X POST localhost:8080/rides/<R1>/offers/D001/accept   # → 200 ACCEPTED
-
-# 4. trip completes
-curl -s -X POST localhost:8080/rides/<R1>/complete # → COMPLETED, D001 AVAILABLE again
-
-# 5. what happened?
-make trace-ride RIDE=<R1>
-```
-
-### State over time
-
-| Step | Ride | Driver D001 | Offer | Who changes it |
-|---|---|---|---|---|
-| 1. Request | `REQUESTED` | `AVAILABLE` | — | ride-service |
-| 2. Saga starts | `MATCHING` | `AVAILABLE` | — | ride-service (command from saga) |
-| 3. Reserve driver | `MATCHING` | **`OFFERED`** | — | driver-service (atomic update) |
-| 4. Offer created | **`DRIVER_ASSIGNED`** (D001) | `OFFERED` | `PENDING` (30 s) | dispatch + ride-service |
-| 5. Accept (pivot) | `DRIVER_ACCEPTED` | **`BUSY`** | `ACCEPTED` | dispatch, then ride + driver |
-| 6. Complete | **`COMPLETED`** | **`AVAILABLE`** | — | ride-service, then driver |
-
-### Flow
+**Flow.**
 
 ```mermaid
 sequenceDiagram
@@ -246,399 +454,535 @@ sequenceDiagram
     actor D as Driver D001
     participant RS as ride-service
     participant XS as dispatch-service
-    participant R as Redis GEO
+    participant R as Redis
     participant DS as driver-service
-
-    P->>RS: POST /rides (Idempotency-Key: k1)
-    RS->>RS: [tx] ride REQUESTED + idempotency key + outbox RideRequested
-    RS-->>P: 201 {rideId: R1, status: REQUESTED}
-    RS-)XS: RideRequested(R1)
-    XS->>XS: [tx] saga(R1) STARTED + outbox StartMatching
-    XS-)RS: StartMatching(R1)
-    RS->>RS: [tx] REQUESTED → MATCHING
-    XS->>R: GEOSEARCH pickup BYRADIUS 2km ASC
-    R-->>XS: [D001 0.8km, D002 1.5km]
-    XS->>XS: drop excluded, Haversine sort (distance, driverId) → D001
-    XS-)DS: ReserveDriver(R1, D001, O1)
-    DS->>DS: [tx] UPDATE drivers SET OFFERED WHERE id=D001 AND status=AVAILABLE → 1 row
-    DS-)XS: DriverReserved(R1, D001)
-    XS->>XS: [tx] offer O1 PENDING (expires +30 s) + outbox AssignDriver
-    XS-)RS: AssignDriver(R1, D001)
-    RS->>RS: [tx] MATCHING → DRIVER_ASSIGNED
-
-    D->>XS: POST /rides/R1/offers/D001/accept
-    XS->>XS: [tx] UPDATE offers SET ACCEPTED WHERE status=PENDING AND expires_at>now() (pivot)
-    XS-->>D: 200 ACCEPTED
-    XS-)DS: MarkDriverBusy → OFFERED → BUSY
+    P->>RS: POST /rides (Idempotency-Key)
+    RS->>RS: [tx] ride REQUESTED + key + outbox RideRequested
+    RS-->>P: 201 REQUESTED
+    RS-)XS: RideRequested
+    XS-)RS: StartMatching → MATCHING
+    XS->>R: GEOSEARCH BYRADIUS ASC
+    XS-)DS: ReserveDriver(D001)
+    DS->>DS: UPDATE … WHERE status='AVAILABLE' → 1 row
+    XS->>XS: offer PENDING (+30 s)
+    XS-)RS: AssignDriver → DRIVER_ASSIGNED
+    D->>XS: accept (pivot)
+    XS-)DS: MarkDriverBusy → BUSY
     XS-)RS: MarkAccepted → DRIVER_ACCEPTED
-
-    D->>RS: POST /rides/R1/complete
-    RS->>RS: [tx] → COMPLETED + outbox RideCompleted
-    RS-)XS: RideCompleted(R1)
-    XS-)DS: ReleaseDriver(R1, D001) → AVAILABLE
+    D->>RS: complete → COMPLETED
+    RS-)XS: RideCompleted
+    XS-)DS: ReleaseDriver → AVAILABLE
 ```
 
-`[tx]` = one Postgres transaction that also writes the inbox and outbox rows. Every arrow between services goes through Redpanda.
+**What we solve here.** No lost event between "ride saved" and "dispatch starts" (outbox). One saga per ride even if the event is delivered twice (saga PK + inbox). Matching is in memory, but the decision is in Postgres. After the pivot, the saga only moves forward.
 
-### How we solve each step
-
-| Step | Problem | Our solution |
-|---|---|---|
-| Request | Client retries or double-clicks | Idempotency key row inserted **first**, in the ride's transaction, with a request hash and the stored response. Same key → same ride (`Idempotent-Replayed: true`); same key + different body → `422` |
-| Hand-off to dispatch | DB write succeeds but the event is lost (dual write) | Transactional **outbox**: the event commits with the ride; a relay publishes it |
-| Saga start | `RideRequested` delivered 3× | **Inbox** skips copies; the saga's primary key is `rideId`, so there is only ever one saga |
-| Matching | Find nearest fast, with latest location | Redis GEO set of `AVAILABLE` drivers, kept current by **versioned** events; Haversine re-check + tie-break in a pure Go function |
-| Reserve | Two rides pick the same driver at once | One **conditional `UPDATE`**; the loser gets 0 rows → `DriverReservationFailed` → tries the next driver |
-| Accept | Accept races timeout, reject or cancel | `UPDATE offers … WHERE status='PENDING' AND expires_at > now()`: exactly one wins. A repeated accept returns `200` with no new commands |
-| After accept | Ride and driver must follow | The accept is the saga's **pivot**: before it everything can be compensated, after it steps are only retried until they succeed |
-| Complete | Late messages must not free the wrong driver | `ReleaseDriver` carries `rideId`; it only applies `WHERE current_ride_id = R1` |
-
-If D001 **rejects** or the **30 s timer** fires instead, D001 is excluded from R1 forever, released to `AVAILABLE`, the ride goes back to `MATCHING`, and the saga offers it to D002. If nobody is left, the ride waits in `MATCHING` and is retried every 10 s and whenever a driver becomes available.
+**Monitoring.** One trace covers all 16 steps across three services and Redpanda. Saga steps (`GET /rides/{id}/dispatch`) and state history (`GET /rides/{id}/history`) are shown live. Metrics: `offers_total{outcome="created"|"accepted"}`, time to first offer.
 
 ---
 
-## 6. Scale: from 1k to 1M drivers
+### 5.2 Reject → rematch
 
-The built system targets **1,000 drivers**. Larger scales are design, not built.
+<p align="center"><img src="img/demo-reject-rematch.png" alt="Reject and rematch in the live demo" width="900"></p>
 
-### Load model
+**Story.** Ride R1 is offered to D001 (600 m). D001 says no. D001 must never see R1 again, but must stay free for other passengers. The saga searches again and offers R1 to D002 (1.1 km), who accepts.
 
-Assumptions: a location update every **4 s** per online driver, ~0.6 rides/driver/hour at peak, ~1.5 offers per ride, ~12 messages per saga.
+| AC | Input | Output |
+|---|---|---|
+| AC-05 | `POST /rides/R1/offers/D001/reject` | `200 REJECTED`; only the driver holding the offer can do this |
+| AC-07 | (same transaction) | `ride_exclusions(R1, D001, REJECTED)`, saga back to `MATCHING` |
+| AC-02 | `ReleaseDriver(R1, D001)` | D001 `OFFERED → AVAILABLE` (only `WHERE current_ride_id = R1`) |
+| AC-06 | `UnassignDriver(R1)` | ride `DRIVER_ASSIGNED → MATCHING`, `assignedDriverId = null` |
+| AC-07 | New `GEOSEARCH` | D001 is nearest **and** AVAILABLE, but excluded → D002 |
+| AC-05 | `AssignDriver(R1, D002)`, then accept | offer O2 `PENDING` → `ACCEPTED`, ride `DRIVER_ACCEPTED` |
+
+**Flow.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor D1 as Driver D001
+    participant XS as dispatch-service
+    participant DS as driver-service
+    participant RS as ride-service
+    Note over XS: R1 OFFERED to D001 (O1 PENDING)
+    D1->>XS: reject
+    XS->>XS: [tx] O1 REJECTED + exclusion(R1, D001) + saga MATCHING<br/>+ outbox ReleaseDriver, UnassignDriver
+    XS-)DS: ReleaseDriver → D001 AVAILABLE
+    XS-)RS: UnassignDriver → MATCHING, driver cleared
+    XS->>XS: match again, skipping {D001} → D002
+    XS-)DS: ReserveDriver(D002) → OFFERED
+    XS-)RS: AssignDriver(D002) → DRIVER_ASSIGNED
+```
+
+**What we solve here.** Rejection is a **compensation**: everything done for D001 is undone in the right services. Exclusion is a table row, so it survives restarts and is permanent. Rematch is a **new query**, not "promote #2 from the old list", so it uses fresh locations. A timeout follows exactly the same path (the sweeper marks the offer `EXPIRED`).
+
+**Monitoring.** The trace shows the reject, both compensations and the second offer in one view. The **Saga steps** tab shows *"driver rejected the offer: excluded for this ride, released, ride back to MATCHING"*. Metric: `offers_total{outcome="rejected"|"expired"}`.
+
+---
+
+### 5.3 Two rides, one driver (the race)
+
+<p align="center"><img src="img/demo-race.png" alt="Two rides race for one driver in the live demo" width="900"></p>
+
+**Story.** Two passengers, A and B, stand 380 m on either side of D001 and request a ride at the same instant. Both sagas see D001 as the nearest AVAILABLE driver and both try to reserve it. Only one may win.
+
+| AC | Input | Output |
+|---|---|---|
+| AC-09 | `POST /rides` × 2 in parallel | two rides, two sagas |
+| AC-04 | Both `GEOSEARCH` | both pick D001 |
+| AC-09 | `ReserveDriver(A, D001)` ∥ `ReserveDriver(B, D001)` | first `UPDATE` → **1 row**, second → **0 rows** |
+| AC-09 | `DriverReservationFailed(B)` | B: *"driver was taken by another ride, trying the next candidate"* → D002 |
+| AC-09 | — | A → D001, B → D002, **double-bookings: 0** |
+
+In our demo runs the two reservations **really collided in the database** (B lost once, A lost once), and the result was correct both times.
+
+**Flow.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant A as Saga A
+    participant B as Saga B
+    participant DS as driver-service
+    participant DB as driver_db
+    Note over A,B: both see D001 as nearest in Redis
+    A-)DS: ReserveDriver(A, D001)
+    B-)DS: ReserveDriver(B, D001)
+    DS->>DB: UPDATE … SET OFFERED, ride=A WHERE id=D001 AND status='AVAILABLE'
+    DB-->>DS: 1 row ✔
+    DS->>DB: UPDATE … SET OFFERED, ride=B WHERE id=D001 AND status='AVAILABLE'
+    DB-->>DS: 0 rows ✘ (already OFFERED)
+    DS-)A: DriverReserved
+    DS-)B: DriverReservationFailed
+    B->>B: skip D001 this round → D002
+```
+
+**What we solve here.** The classic lost update ("read AVAILABLE, then write OFFERED"). The guard is a single **compare-and-set** statement in the service that owns the driver; Postgres row locking makes the second writer wait, re-check the `WHERE` and change nothing. No lock service, correct with any number of replicas.
+
+**Monitoring.** One trace per ride (A and B both have a trace button on every step). Metric: `driver_reservation_conflicts_total`. In a hot zone, the ratio conflicts / offers is the early warning (section 6).
+
+---
+
+### 5.4 Cancel vs accept
+
+<p align="center"><img src="img/demo-cancel-vs-accept.png" alt="Cancel races accept in the live demo" width="900"></p>
+
+**Story.** R1 has a pending offer for D001. At the same moment, the passenger taps **Cancel** and the driver taps **Accept**. Two services, two requests, no shared transaction. Whatever order they land in, the end must be: ride `CANCELLED`, driver `AVAILABLE`, saga `CANCELLED`.
+
+| AC | Input | Output |
+|---|---|---|
+| AC-06 | `POST /rides/R1/cancel` | `200 CANCELLED` (ride-service owns the lifecycle) |
+| AC-05 | `POST …/offers/D001/accept` (in parallel) | either `200 ACCEPTED` (offer row won) or `409` (cancel got there first) |
+| AC-06 | `MarkAccepted(R1)` | refused: ride is terminal → `CommandRejected(RIDE_TERMINAL)` |
+| AC-10 | `RideCancelled(R1)` | saga `CANCELLED`; the second of the two messages is a no-op |
+| AC-02 | `ReleaseDriver(R1, D001)` | D001 `AVAILABLE`, `currentRideId = null` |
+
+In our run, the accept won the offer row (`200 ACCEPTED`) **and** the cancel won the ride, so ride-service refused `MarkAccepted` and the saga compensated. The ride history has no `DRIVER_ACCEPTED`.
+
+**Flow.**
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor P as Passenger
+    actor D as Driver D001
+    participant RS as ride-service
+    participant XS as dispatch-service
+    participant DS as driver-service
+    par
+        P->>RS: cancel
+        RS->>RS: [tx] → CANCELLED + outbox RideCancelled
+    and
+        D->>XS: accept
+        XS->>XS: O1 PENDING → ACCEPTED
+    end
+    XS-)RS: MarkAccepted → refused (terminal)
+    RS-)XS: CommandRejected + RideCancelled
+    XS->>XS: saga CANCELLED (once)
+    XS-)DS: ReleaseDriver → AVAILABLE (only if current_ride_id = R1)
+```
+
+**What we solve here.** Each service decides what it owns: ride-service decides the ride, dispatch decides the offer. Terminal states are final, so a late command cannot revive a cancelled ride. Every message is safe to apply twice and in any order. `ReleaseDriver` follows `MarkDriverBusy` on the same `driverId` partition, so the driver can never get stuck in `BUSY`.
+
+**Monitoring.** The trace shows both requests side by side and the compensation after them. The saga step says which path won: *"ride cancelled by passenger"* or *"ride refused MarkAccepted (RIDE_TERMINAL), compensating"*.
+
+---
+
+## 6. Scalability
+
+### 6.1 One number explains the design
+
+At one location update every 4 s per online driver:
 
 | | 1,000 drivers | 100,000 drivers | 1,000,000 drivers |
 |---|---|---|---|
-| Location updates | 250 /s | 25,000 /s | **250,000 /s** |
-| Ride requests (peak) | 0.2 /s | 17 /s | ~170 /s (bursts ~500 /s) |
-| Offers | 0.3 /s | 25 /s | ~250 /s |
-| Saga messages | ~3 /s | ~200 /s | ~2,000 /s |
-| Redis GEO memory (~120 B/driver) | 120 KB | 12 MB | ~120 MB |
+| **Location updates** | 250 /s | 25,000 /s | **250,000 /s** |
+| Ride requests (peak) | 0.2 /s | 17 /s | ~170 /s |
+| Redis GEO memory | 120 KB | 12 MB | ~120 MB |
 
-> **Key insight:** location traffic grows to 250k writes/s while dispatch stays below ~1k/s. Scaling this system is about **ingesting locations and querying the geo index**, not about rides. That is why driver-service (the location path) is its own service.
+> **Rides are not the problem. Locations are.** Scaling this system means ingesting locations and querying the geo index. That is why the location path (driver-service) is its own service.
 
-### Evolution path
+### 6.2 We measured it: k6 load tests
+
+Victor ran three k6 scenarios against the full stack on one laptop (4 vCPU VM shared by k6, all services and Grafana), in an **open model**: requests keep arriving at the target rate even when the system slows down, so overload shows as latency and errors instead of hiding.
+
+| Scenario | One iteration | Tests |
+|---|---|---|
+| `location` | `PUT /drivers/{id}/location`, random driver of 1,000 | location write path |
+| `dispatch` | create ride → wait for offer → accept → complete, 50 areas | the saga end to end |
+| `hotzone` | the same journey, all rides in **one** area with 8 drivers | contention |
+
+### 6.3 What broke, in order
+
+| # | Finding | Evidence |
+|---|---|---|
+| **F1** | 🚪 **The gateway breaks first** at ~1,000 req/s: `502`s while the services are idle | 78,450 × `502`; driver-service CPU 22 %, nginx 113–251 %; `worker_connections are not enough` |
+| **F2** | 📍 **Location writes saturate** above ~1,000 req/s (≈ 4,000 online drivers), max ~1,800 req/s | p95 9 ms → 935 ms → 4.5 s; outbox backlog 114k rows |
+| **F3** | 🔌 A bigger DB pool did **not** help (4 → 24 connections) | 1,233 vs 1,721 req/s; the VM was ~95 % busy |
+| **F4** | 🔥 **Hot zone = contention, not capacity** | conflicts / offers 0 % → 8 % → 292 % → 555 %; 75.6 % of journeys complete; CPU < 40 %, HTTP errors 0 % |
+| **F5** | ✅ **Normal dispatch is healthy** to 40 rides/s | 0 errors, HTTP p95 9 ms |
+
+**F1: gateway (via nginx).** Each request opened a new TCP connection to the service. Fix tested: upstream keepalive + `worker_connections 16384` → **0 errors at 1,000 req/s**.
+
+![Location load via the gateway](../docs/img/load-test/grafana-location-gateway.png)
+
+**F2: location writes (bypassing the gateway).** Each update = `UPDATE drivers` + `INSERT outbox` + later `UPDATE outbox` + a broker message to update Redis. The knee is between 1,000 and 2,000 req/s; then throughput *falls*. No data was lost: the backlog drained after the test.
+
+![Location load direct to driver-service](../docs/img/load-test/grafana-location-direct.png)
+
+**F5: the saga.** 40 rides/s with 0 errors; at 80 rides/s the gateway (F1) failed first, not the saga.
+
+![Dispatch journey load](../docs/img/load-test/grafana-dispatch.png)
+
+**F4: hot zone.** HTTP looks perfect (p95 253 ms, 0 errors) while a quarter of passengers get no driver. Only business metrics show it.
+
+![Hot zone load](../docs/img/load-test/grafana-hotzone.png)
+
+### 6.4 What it means
+
+* The order of failure matches the design: **gateway → location writes → hot zones**. Redis GEO, partitions and the dispatch database were never the limit.
+* Absolute numbers are a **floor** (everything shared one laptop). The order is the result.
+* **Alert on business metrics**, not only HTTP: conflict ratio, time to assign, journey success, outbox backlog.
+
+### 6.5 The growth path
 
 ```mermaid
 flowchart LR
-    A["<b>1k drivers (built)</b><br/>1 replica per service<br/>1 Postgres · 1 Redis · 1 broker<br/>location → Postgres"]
-    B["<b>100k drivers</b><br/>location fast path<br/>replicas + 24–48 partitions<br/>cluster per service, CDC"]
-    C["<b>1M drivers</b><br/>GEO sharded by H3 cell<br/>area-owned dispatchers<br/>batch matching in hot cells<br/>drivers sharded by city"]
+    A["<b>1k drivers · built</b><br/>1 replica each<br/>location → Postgres"]
+    B["<b>100k drivers</b><br/>gateway keepalive + replicas<br/>location fast path (stream)<br/>more partitions, cluster per service"]
+    C["<b>1M drivers</b><br/>Redis GEO sharded by H3 cell<br/>area-owned dispatchers<br/>batch matching in hot cells"]
     A --> B --> C
 ```
 
-### The seven topics the challenge asks about
-
-| Topic | 1k (built) | 100k | 1M |
-|---|---|---|---|
-| **Location storage** | `UPDATE drivers` + outbox event per update | Compacted topic `driver.locations.v1`; batched Postgres snapshot every 30 s | Same, partitioned by city |
-| **Matching** | `GEOSEARCH` on one key, sub-ms | Same; ~25k `GEOADD`/s on one Redis primary | One GEO key per **H3 cell** (res 7, ~5 km²); search pickup cell + neighbours |
-| **Database** | One Postgres server, 3 databases | Cluster per service, read replicas, `rides` partitioned by month | `driver_db` sharded by city; reservation stays a single-row update |
-| **Broker** | 1 Redpanda node, 6 partitions/topic | 3 nodes, RF=3, 24–48 partitions | More nodes, 100+ partitions for location, tiered storage |
-| **Dispatch workers** | 1 instance; sweepers use `SKIP LOCKED` (replica-safe) | N replicas, sagas spread by `rideId` | Partition dispatch by **area**: one owner per area |
-| **Caching** | Not needed (Redis is a read model) | `GET /rides/{id}` cached ~1 s | Push (SSE/WebSocket/gRPC) instead of polling |
-| **Partitioning** | Keyed by `rideId`/`driverId` (order per aggregate) | More partitions, same keys | Partition by **geography** so one area's data and work live together |
+Full details: [load-test-report.md](../docs/load-test-report.md) · [scalability.md](../docs/scalability.md).
 
 ---
 
-## 7. Bonus: what we added and why
+## 7. How we solved each problem
 
-Ten things beyond the acceptance criteria. For each: the options, how they compare, and what we chose.
+### 7.0 Overview
 
-### 7.1 Redis GEOSEARCH for matching (Geohash vs H3 vs PostGIS)
-
-**The problem:** "Find the nearest `AVAILABLE` driver within 2 km" must be fast at any fleet size. Scanning every driver and computing Haversine is O(N) per ride. We need a **spatial index**.
-
-There are three common ways to index locations:
-
-#### Option A: Geohash grid (what Redis GEO uses)
-
-Geohash splits the world into a grid of **squares** by interleaving latitude and longitude bits into one number. Nearby points usually share a prefix. Redis stores each member as a 52-bit geohash used as a **sorted-set score** (~0.6 m precision).
-
-`GEOSEARCH … BYRADIUS 2 km` works like this:
-
-```
-   ┌─────┬─────┬─────┐
-   │  NW │  N  │  NE │     1. pick a geohash precision whose cell is ≥ the radius
-   ├─────┼─────┼─────┤     2. take the center cell + its 8 neighbours (9 boxes)
-   │  W  │  ●  │  E  │     3. each box = one score range in the sorted set → range scans
-   ├─────┼─────┼─────┤     4. compute exact distance, drop points outside the circle
-   │  SW │  S  │  SE │     5. sort ASC, return with distance/coordinates
-   └─────┴─────┴─────┘
-        ● = pickup, ◯ = 2 km circle inside the 9 boxes
-```
-
-Cost depends on **drivers near the pickup**, not on fleet size.
-
-#### Option B: H3 hexagonal grid (Uber)
-
-H3 covers the Earth with **hexagons** at 16 resolutions (res 7 ≈ 5.2 km², res 8 ≈ 0.74 km², res 9 ≈ 0.1 km²). Each cell has a 64-bit id; `gridDisk(cell, k)` returns the cell and its rings of neighbours.
-
-```
-   Square grid (geohash)              Hexagon grid (H3)
-
-   ┌───┬───┬───┐                         ⬡   ⬡
-   │ d │ e │ d │   e = edge neighbour  ⬡   ●   ⬡     all 6 neighbours
-   ├───┼───┼───┤   d = corner          ⬡   ⬡         are the SAME distance
-   │ e │ ● │ e │       neighbour,                     from the center
-   ├───┼───┼───┤       √2 ≈ 1.41× farther
-   │ d │ e │ d │
-   └───┴───┴───┘   8 neighbours, 2 distances
-```
-
-Why Uber built it: hexagons have **one neighbour distance**, so "ring k" is a good approximation of a circle; cells are similar in size and shape; and cells are a natural **unit for sharding and analytics** (supply/demand per cell, surge pricing). Geohash squares also have **edge effects**: two points a metre apart can sit in cells with very different prefixes, which is why Redis always checks the 8 neighbours.
-
-#### Option C: PostGIS in Postgres
-
-`ST_DWithin` + a GiST/KNN index on the `drivers` table. Always fresh, same database, no projection to maintain.
-
-#### Comparison
-
-| | Redis GEO (geohash) | H3 cells (+ Redis per cell) | PostGIS |
-|---|---|---|---|
-| Query | `GEOSEARCH BYRADIUS ASC`, built in | Look up pickup cell + `gridDisk` ring, then query each cell | `ST_DWithin` + KNN `<->` |
-| Speed | In memory, sub-ms | In memory, sub-ms | ms, on disk/buffer cache |
-| Freshness | Eventually consistent (fed by events) | Eventually consistent | Always fresh |
-| Write load | Location writes never touch reservation rows | Same | Every update churns the DB that decides reservations |
-| Sharding | One key per set; cannot split one key across a cluster | **Natural**: one key per cell, spread over a cluster | Shard by city |
-| Neighbour shape | Squares, 2 neighbour distances | Hexagons, uniform | Exact distance |
-| Complexity | Lowest: one command | Library + cell bookkeeping + border queries | Extension + index tuning |
-| Best at | Up to a few 100k drivers in one set | 1M+ drivers, city/cell partitioning | Small fleets, one database |
-
-#### What we chose
-
-* **Now (1k–100k): Redis GEO.** Simplest, sub-ms, and keeps the 250k/s location stream away from the Postgres rows that guarantee correctness.
-* **At 1M: H3 on top of Redis GEO.** One GEO key per H3 cell (res 7), spread across a Redis Cluster; query the pickup cell and its ring-1 neighbours. The same cells partition dispatch by area. ([scalability S2](../docs/scalability.md#5-scaling-strategies))
-* **Redis is only a hint.** driver-service confirms the pick with the atomic update. A stale index costs one retry, never a wrong assignment.
-
-How we keep the index correct ([projection.go](../services/dispatch/internal/usecase/projection.go)):
-
-```
-driver-service ──DriverStatusChanged / LocationUpdated (version N)──► dispatch projector
-                                                                         │ Lua script, atomic:
-                                                                         │ if N > stored.version:
-                                                                         │   AVAILABLE → GEOADD
-                                                                         │   otherwise → ZREM
-                                                                         ▼
-                                              geo:drivers:available  +  driver:{id} {status,lat,lng,version}
-```
-
-Old and duplicate events are ignored by version, so matching always uses the **latest** location (AC-03). `GEOSEARCH` returns `20 + |excluded|` candidates, widened if a tie is cut off, then the pure function `SelectNearest` applies exclusions, Haversine, radius and tie-break, fully unit-tested without Redis.
-
-References: [Redis geospatial docs](https://redis.io/docs/latest/develop/data-types/geospatial/) · [Uber: H3 hexagonal hierarchical spatial index](https://www.uber.com/blog/h3/) · [h3geo.org](https://h3geo.org/) · [ADR-001](../docs/adr/ADR-001-matching.md)
+| # | Problem | Our solution | AC | In short | Read more |
+|---|---|---|---|---|---|
+| 7.1 | Find the nearest driver fast | **Redis GEOSEARCH** projection + Haversine in Go | 03, 04 | In-memory search, versioned updates, rebuildable | [ADR-001](../docs/adr/ADR-001-matching.md) |
+| 7.2 | Two rides grab one driver | **Compare-and-set (CAS) in SQL** | 09 | `UPDATE … WHERE status='AVAILABLE'`; row count decides | [ADR-002](../docs/adr/ADR-002-concurrency.md) |
+| 7.3 | One lifecycle across 3 services | **Orchestrated saga** with compensations and a pivot | 05, 06, 07, 10 | dispatch drives each ride; undo before accept, retry after | [ADR-003](../docs/adr/ADR-003-saga-orchestration.md) |
+| 7.4 | Lost or duplicate events | **Transactional outbox + inbox** | 08, 10 | State and messages commit together; consumers skip repeats | [ADR-004](../docs/adr/ADR-004-messaging-outbox-inbox.md) |
+| 7.5 | Client retries `POST /rides` | **Idempotency key with stored response** | 01, 08 | Same key → same ride; reused key with a new body → `422` | [patterns P8](../docs/patterns.md#p8-idempotency-key-with-stored-response) |
+| 7.6 | Invalid or repeated transitions | **Explicit state machines** | 02, 06 | Pure functions: changed / duplicate (no-op) / invalid (`409`) | [patterns P7](../docs/patterns.md#p7-explicit-state-machines) |
+| 7.7 | The 30 s offer timeout | **`expires_at` + sweeper with `SKIP LOCKED`** | 05 | Survives restarts; cancelled by a conditional update | [ADR-003](../docs/adr/ADR-003-saga-orchestration.md) |
+| 7.8 | Message order at scale | **Redpanda, partitioned by `rideId` / `driverId`** | 10 | Order per ride, scale per partition | [ADR-009](../docs/adr/ADR-009-message-broker.md) |
+| 7.9 | Change radius / timeout without a redeploy | **Redis config + 1 s in-process cache** | 04, 05 | `config:dispatch`; `PUT /dispatch/config` or `HSET` | [local-development §7](../docs/local-development.md#7-configuration) |
+| 7.10 | "What happened to ride R001?" | **One trace per ride** + ids on every log line | obs. | Stored `traceparent`; Grafana Loki/Tempo | [ADR-005](../docs/adr/ADR-005-observability.md) |
+| 7.11 | Boundaries that can grow | **3 services + Clean Architecture + gateway + gRPC streams** | all | Split by how parts scale; rules enforced by a test | [ADR-006](../docs/adr/ADR-006-service-architecture.md), [ADR-012](../docs/adr/ADR-012-clean-architecture.md) |
+| 7.12 | Proving it works | **Tests at every level + CI + k6** | all | Races proven on a real database | [testing.md](../docs/testing.md) |
 
 ---
 
-### 7.2 Saga orchestration (vs 2PC vs choreography vs Temporal)
+### 7.1 Finding the nearest driver: Redis GEO vs H3 vs PostGIS
 
-**The problem:** one dispatch changes three aggregates in three databases: **ride**, **driver**, **offer**. The flow has a **loop** (rematch), a **timer** (30 s) and **compensations** (release driver, unassign ride), plus cancellation at any time.
+**Problem.** Scanning every driver and computing distance is O(N) per ride. We need a **spatial index**, and it must reflect the **latest** location.
 
-| Option | How it works | Pros | Cons | Verdict |
-|---|---|---|---|---|
-| Two-phase commit | A coordinator locks all databases, then commits | Atomic | Blocking; a coordinator crash leaves locks; Kafka can't take part | ❌ |
-| Choreography | Services react to each other's events | No central service | The loop, timer and exclusions have no owner; "what happened to R1?" needs many streams | ❌ |
-| **Orchestration, hand-rolled** | dispatch-service sends commands and reacts to replies; state in Postgres | One owner of the flow; every step visible in SQL, logs and one trace; no extra infra | We write timers, retries and resume ourselves | ✅ **Chosen** |
-| Temporal | Durable workflows as code | Timers, retries, history built in | Another cluster to run; hides the mechanics we were asked to explain | Future, when more workflows appear |
+**Option A: Geohash grid (Redis GEO).** Geohash cuts the world into **squares** and turns latitude/longitude into one number; Redis stores it as a sorted-set score (~0.6 m precision). `GEOSEARCH … BYRADIUS` reads the pickup's square and its 8 neighbours, then filters by exact distance.
+
+```
+   ┌────┬────┬────┐
+   │ NW │ N  │ NE │   1. choose a square size ≥ the radius
+   ├────┼────┼────┤   2. read the centre square + 8 neighbours (9 range scans)
+   │ W  │ ●  │ E  │   3. keep points inside the circle, sort by distance
+   ├────┼────┼────┤
+   │ SW │ S  │ SE │   Cost depends on drivers NEAR the pickup, not on fleet size.
+   └────┴────┴────┘
+```
+
+**Option B: H3 hexagons (Uber).** H3 covers the Earth with **hexagons** at 16 sizes (res 7 ≈ 5.2 km², res 8 ≈ 0.74 km²). A hexagon's 6 neighbours are all the **same distance** away, so "this cell + one ring" is a good circle, and cells make natural **shards**.
+
+```
+   Squares (geohash)                 Hexagons (H3)
+   ┌───┬───┬───┐                        ⬡   ⬡
+   │ d │ e │ d │  e = edge (1×)       ⬡   ●   ⬡    6 neighbours,
+   ├───┼───┼───┤  d = corner (1.41×)    ⬡   ⬡      all the same distance
+   │ e │ ● │ e │
+   └───┴───┴───┘  8 neighbours, 2 distances
+```
+
+**Option C: PostGIS.** `ST_DWithin` + a KNN index on the `drivers` table. Always fresh, but every location update hits the same rows the reservation locks.
+
+| | Redis GEO | H3 cells (+ Redis per cell) | PostGIS |
+|---|---|---|---|
+| Speed | sub-ms, in memory | sub-ms, in memory | ms |
+| Freshness | eventual (event-fed) | eventual | always fresh |
+| Write load on the reservation DB | none | none | **every update** |
+| Sharding | one key can't be split | **one key per cell** | shard by city |
+| Complexity | **one command** | library + border queries | extension + tuning |
+| Best for | up to a few 100k drivers | 1M+ drivers | small fleets |
+
+**We chose** Redis GEO now, H3 cells on top of it at 1M drivers. Redis is only a **hint**: driver-service confirms the pick (7.2), so a stale index costs one retry, never a wrong assignment.
+
+**How the index stays correct.** Every driver event carries a `version`. A Lua script applies an event only if it is newer, so duplicates and out-of-order events are ignored. The final choice is a pure Go function (`SelectNearest`: exclusions, Haversine, radius, tie-break), unit-tested without Redis.
+
+References: [Redis geospatial](https://redis.io/docs/latest/develop/data-types/geospatial/) · [Uber H3](https://www.uber.com/blog/h3/) · [h3geo.org](https://h3geo.org/)
+
+---
+
+### 7.2 Two rides, one driver: compare-and-set (CAS) in SQL
+
+**Problem.** "Read status → check AVAILABLE → write OFFERED" is a **check-then-act** race: two sagas can both read AVAILABLE and both write.
+
+**Solution.** Do the check and the write in **one statement** and let the database answer:
+
+```sql
+UPDATE drivers
+SET    status = 'OFFERED', current_ride_id = $ride, version = version + 1
+WHERE  id = $driver AND status = 'AVAILABLE';    -- 1 row: you won · 0 rows: someone else did
+```
+
+This is **compare-and-set**: "set the new value only if the current value is still what I expect". Postgres locks the row for the first writer; the second waits, re-checks the `WHERE` on the new row and updates nothing.
+
+| Option | Pros | Cons | Verdict |
+|---|---|---|---|
+| **CAS `UPDATE … WHERE status=…`** | One statement; the row count is the answer; correct across replicas and crashes; no extra infrastructure | The driver row is a serialisation point (hot zones) | ✅ |
+| Distributed lock (Redis `SET NX`, Redlock) | Familiar | A lease can expire during a pause → two holders, unless the database checks again anyway | ❌ |
+| Optimistic version check (`WHERE version = $v`) | General purpose | Needs a read first; more retries | Used for rides |
+
+**The same CAS decides every race:**
+
+| Race | Statement |
+|---|---|
+| accept vs reject vs timeout vs cancel | `UPDATE offers … WHERE id=$o AND status='PENDING' [AND expires_at > now()]` |
+| late release of a driver who moved on | `UPDATE drivers … WHERE id=$d AND current_ride_id=$ride` |
+| ride transitions | `SELECT … FOR UPDATE`, state machine, `UPDATE … version+1` |
+
+**Defence in depth:** partial unique indexes (one `PENDING` offer per driver and per ride) and a `CHECK` on drivers. **Proof:** 50 rounds of two goroutines behind a barrier on real Postgres; exactly one wins every time. **Cost (seen in k6, F4):** in a hot zone many sagas chase the same rows → batch matching per area is the fix (section 8).
+
+---
+
+### 7.3 One lifecycle across three services: orchestrated saga
+
+**Problem.** Ride, driver and offer live in three databases. The flow loops (rematch), waits (30 s) and must be undoable (cancel).
+
+| Option | Verdict | Why |
+|---|---|---|
+| Two-phase commit | ❌ | Blocking; a coordinator crash leaves locks; Kafka can't take part |
+| Choreography (services react to events) | ❌ | The loop, timer and exclusions have no owner; "what happened?" needs many streams |
+| **Orchestration, hand-rolled** | ✅ | One owner; every step visible in SQL, logs and one trace; no extra server |
+| Temporal | later | Great when there are many workflows; hides the mechanics we wanted to show |
 
 ```mermaid
 stateDiagram-v2
     direction LR
-    [*] --> STARTED: RideRequested
-    STARTED --> MATCHING: StartMatching ok
+    [*] --> STARTED
+    STARTED --> MATCHING
     MATCHING --> RESERVING: nearest candidate
-    RESERVING --> OFFERED: DriverReserved
-    RESERVING --> MATCHING: ReservationFailed (try next)
+    RESERVING --> MATCHING: reservation lost
+    RESERVING --> OFFERED: reserved
     MATCHING --> WAITING_FOR_DRIVER: nobody eligible
-    WAITING_FOR_DRIVER --> MATCHING: retry 10 s / driver available
-    OFFERED --> MATCHING: reject / 30 s timeout<br/>(exclude + release)
+    WAITING_FOR_DRIVER --> MATCHING: retry / driver free
+    OFFERED --> MATCHING: reject / timeout
     OFFERED --> ACCEPTED: accept = PIVOT
-    ACCEPTED --> COMPLETED: RideCompleted (release)
-    STARTED --> CANCELLED: cancel (compensate)
-    MATCHING --> CANCELLED
-    WAITING_FOR_DRIVER --> CANCELLED
-    RESERVING --> CANCELLED: release driver
-    OFFERED --> CANCELLED: cancel offer + release
-    ACCEPTED --> CANCELLED: release driver
+    ACCEPTED --> COMPLETED
 ```
 
-**Pivot:** before accept, every step has a compensation. After accept, steps are only retried until they succeed. Background workers expire offers (`SKIP LOCKED`), retry waiting rides and **resume** stuck sagas after 30 s. ([ADR-003](../docs/adr/ADR-003-saga-orchestration.md), [patterns P1](../docs/patterns.md#p1-saga-orchestration-with-compensations-and-a-pivot))
+**The pivot.** Before the driver accepts, every step has a compensation (release driver, unassign ride, cancel offer). After it, steps are only retried. Background workers expire offers, retry waiting rides and re-send the last command of a stuck saga.
 
 ---
 
-### 7.3 Concurrency control with database guarantees (vs distributed locks)
+### 7.4 Lost or duplicate events: outbox + inbox
 
-**The race:** two sagas read Redis at the same moment and both pick D001. "Read status, check `AVAILABLE`, then write" lets both succeed.
-
-```
-Saga R1: GEOSEARCH → D001 ┐
-                          ├─► both send ReserveDriver(D001)
-Saga R2: GEOSEARCH → D001 ┘
-
-driver-service:
-  UPDATE drivers SET status='OFFERED', current_ride_id=R1 WHERE id='D001' AND status='AVAILABLE'  → 1 row ✔
-  UPDATE drivers SET status='OFFERED', current_ride_id=R2 WHERE id='D001' AND status='AVAILABLE'  → 0 rows ✘
-  → R2 gets DriverReservationFailed, tries D002
-```
-
-| Option | Pros | Cons | Verdict |
-|---|---|---|---|
-| **Atomic conditional `UPDATE … WHERE status=…`** | One statement; row count = answer; correct across replicas and crashes; no extra infra | The driver row is a serialisation point | ✅ **Chosen** |
-| Distributed lock (Redis `SET NX` / Redlock) | Familiar | A lease can expire during a GC pause or network delay → two holders, unless the DB re-checks anyway | ❌ |
-| Optimistic version check | Works | Same idea, more code | Used for rides (`version`) |
-
-The same pattern decides **every** race: accept vs reject vs timeout vs cancel (`WHERE status='PENDING'`), late releases (`WHERE current_ride_id=$ride`), ride transitions (`SELECT … FOR UPDATE`). Lock order is always saga → offer, so no deadlocks. **Defence in depth:** partial unique indexes (one `PENDING` offer per driver and per ride) and a `CHECK` constraint on drivers.
-
-**Proof:** 50 rounds of two goroutines behind a barrier on real Postgres; exactly one wins every round. ([ADR-002](../docs/adr/ADR-002-concurrency.md))
-
----
-
-### 7.4 Reliable messaging: outbox + inbox (vs "exactly-once")
-
-**The dual-write problem:** writing to Postgres and then publishing to Kafka can half-fail: the DB commits but the event is lost (stuck ride), or the event goes out but the DB rolls back (phantom event).
+**Problem (dual write).** "Save to Postgres, then publish to Kafka" can half-fail: the ride is saved but the event is lost (stuck ride), or the event goes out but the save rolls back (phantom).
 
 ```
  ┌──────────── one Postgres transaction ────────────┐
- │ INSERT inbox(consumer, event_id) ON CONFLICT ─► 0 rows? skip (duplicate)
- │ UPDATE business row (state machine)              │
- │ INSERT outbox(message, traceparent)              │
+ │ INSERT inbox(consumer, event_id) → conflict? skip │  ← duplicates stop here
+ │ UPDATE business row (state machine)               │
+ │ INSERT outbox(message, traceparent)               │  ← the event commits with the state
  └───────────────────────────────────────────────────┘
-          │ relay polls every 50 ms, publishes in id order (acks=all)
-          ▼
-      Redpanda topic (keyed by rideId / driverId) ──► next consumer (same pattern)
+        relay (every 50 ms) → Redpanda → next consumer (same pattern)
 ```
 
 | Option | Verdict | Why |
 |---|---|---|
-| **At-least-once + idempotent consumers (inbox)** | ✅ Chosen | No loss, works with any broker, crash-safe |
-| Kafka "exactly-once" transactions | ❌ | Only covers Kafka; the Postgres write is outside it, so dedup is still needed |
-| Outbox + CDC (Debezium) | Future | Lower latency at volume, but needs Kafka Connect |
+| **At-least-once + idempotent consumers** | ✅ | No loss; works with any broker |
+| Kafka "exactly-once" | ❌ | Covers Kafka only; the Postgres write is outside it |
+| Outbox + CDC (Debezium) | later | Lower latency at volume; needs Kafka Connect |
 
-**If a message arrives twice:** the inbox insert conflicts → skipped. **If processing fails:** the transaction rolls back, the offset isn't committed, retry 5× (100 ms → 5 s, with jitter), then `<topic>.dlq` + `ERROR` log; `make replay-dlq`. A killed service catches up from Redpanda after restart (tested with a kill/restart drill). ([ADR-004](../docs/adr/ADR-004-messaging-outbox-inbox.md))
-
----
-
-### 7.5 Redpanda instead of Kafka
-
-| Option | Pros | Cons | Verdict |
-|---|---|---|---|
-| **Redpanda** | Kafka API (same client code); one C++ binary, no JVM or ZooKeeper; starts in seconds; `rpk` + Console | Smaller community | ✅ **Chosen** |
-| Apache Kafka (KRaft) | The standard, biggest ecosystem | JVM heap, heavier on a laptop | Switching = change `KAFKA_BROKERS` |
-| RabbitMQ | Simple queues, delayed messages | No replayable, partitioned log | ❌ |
-
-We needed **per-key ordering**, **retention + replay** (catch up after restart, rebuild projections, DLQ) and **consumer groups**. Kafka semantics give all three. Kafka has no delayed messages, so the 30 s offer timeout lives in Postgres (`offers.expires_at` + a sweeper) and survives restarts. ([ADR-009](../docs/adr/ADR-009-message-broker.md))
+**Failure:** the transaction rolls back and the offset is not committed → retry 5× with backoff and jitter → `<topic>.dlq` + `make replay-dlq`.
 
 ---
 
-### 7.6 Partitioning to keep messages in order
+### 7.5 Client retries: idempotency key with stored response
 
-Topics are keyed by **`rideId`** (ride topics, replies) and **`driverId`** (driver topics). Every message about one ride lands on one partition, in order, while services scale out by partition.
+The key row is inserted **first, in the ride's transaction**, with a hash of the request and the response.
 
-```
-ride.events.v1  (6 partitions)
-  P0: R7 Requested → R7 Assigned → R7 Accepted     ← one consumer, in order
-  P1: R2 Requested → R9 Requested → R2 Cancelled
-  ...
-consumer group "dispatch": instance A owns P0–P2, instance B owns P3–P5
-```
+| Case | Result |
+|---|---|
+| Same key, same body | original `201` + `Idempotent-Replayed: true`, no new ride |
+| Same key, different body | `422 IDEMPOTENCY_KEY_REUSED` |
+| Same key, 10 requests in parallel | the others wait on the key's row lock, then replay → **1 ride** |
 
-The outbox relay publishes in `outbox.id` order, and the inbox removes duplicates. Topics: `ride.events.v1`, `driver.events.v1`, `ride.commands.v1`, `driver.commands.v1`, `dispatch.replies.v1`, each with a `.dlq`.
+Why not "check if the key exists, then insert"? That is the same check-then-act race as 7.2; the primary key makes it atomic.
 
 ---
 
-### 7.7 Microservices with Clean Architecture (vs modular monolith)
+### 7.6 Explicit state machines
 
-| Option | Pros | Cons | Verdict |
-|---|---|---|---|
-| Modular monolith | One transaction, simplest to run, enough for 1k drivers | No independent scaling; doesn't meet our learning goal | The right default without that goal |
-| **3 microservices, DB per service** | The location path scales on its own; practice with sagas, idempotent messaging, tracing | Eventual consistency; more infrastructure; over the timebox | ✅ **Chosen**, deliberately |
+Each state machine is a pure function that returns one of three answers:
 
-We kept the cost low: only **three** services (one per aggregate), one shared bootstrap package, one Compose file, one **nginx gateway** so clients never see three services. Database users enforce ownership, so each DB can move to its own cluster without code changes.
-
-Inside each service, **Clean Architecture** with a test (`test/arch`) that fails if `domain` imports infrastructure or adapters import each other. Result: all flows are unit-testable with fakes, and the atomic SQL lives in one adapter. ([ADR-006](../docs/adr/ADR-006-service-architecture.md), [ADR-012](../docs/adr/ADR-012-clean-architecture.md))
-
----
-
-### 7.8 Go, with gRPC streams for the driver app
-
-**Go** (standard library first): ~20 MB images, millisecond start-up, goroutines for every consumer loop and worker. ([ADR-007](../docs/adr/ADR-007-language-and-libraries.md))
-
-Next to REST v1, the two **highest-frequency driver calls** are also gRPC v2 streams:
-
-| v2 RPC | Replaces | Why a stream |
+| Answer | Example | Effect |
 |---|---|---|
-| `DriverLocationService/StreamLocations` | `PUT /drivers/{id}/location` every few seconds | One long connection instead of one HTTP request per update; each update acknowledged. This is the first step of the location fast path (S1) |
-| `OfferService/WatchOffers` | Polling `GET /drivers/{id}/offer` | Offers are **pushed** (`OFFERED`, then `CLOSED`) |
+| **changed** | `MATCHING → DRIVER_ASSIGNED` | stored + history row + event |
+| **duplicate** | `DRIVER_ACCEPTED → DRIVER_ACCEPTED` (same driver) | `200`, nothing changes (AC-08) |
+| **invalid** | `COMPLETED → DRIVER_ASSIGNED` | `409 INVALID_TRANSITION` |
 
-Both call the same use cases as REST. Try: `make grpc-offers DRIVER=D001` and request a ride in another terminal. ([ADR-010 Part 6](../docs/adr/ADR-010-api-and-identifiers.md#part-6-grpc-api-v2-for-two-driver-app-apis))
-
----
-
-### 7.9 Observability: one trace per ride
-
-**"What happened to ride R001?"** must be answerable from logs (challenge requirement).
-
-* **Logs:** `key=value` lines; every line carries `ride_id`, `driver_id`, `event_id`, `causation_id`, `trace_id`. HTTP bodies and every produced/consumed message are logged.
-* **Traces:** the ride's `traceparent` is **stored** with the saga, so every later step (offers, rejections, a timeout 30 s later, acceptance, completion) joins **one trace** across all services and Redpanda.
-* **Metrics:** offers by outcome, time to first offer, reservation conflicts, outbox backlog, consumer outcomes, HTTP latency, on a provisioned Grafana dashboard.
-* **Stack:** OpenTelemetry → Grafana LGTM (Loki, Tempo, Prometheus) in one container. Vendor-neutral.
-
-([ADR-005](../docs/adr/ADR-005-observability.md), [observability.md](../docs/observability.md))
+Table-driven unit tests cover every pair of states.
 
 ---
 
-### 7.10 Tests at every level, CI and documentation
+### 7.7 The 30 s offer timeout
+
+| Option | Problem |
+|---|---|
+| In-memory timer | lost on restart |
+| Broker delayed message | Kafka/Redpanda has none; hard to cancel when the driver answers |
+| **`offers.expires_at` + sweeper** ✅ | survives restarts; cancelled for free by the CAS on `status='PENDING'` |
+
+The sweeper runs every second with `FOR UPDATE SKIP LOCKED`, so several dispatch replicas never block each other, and an offer expires at most once. Accept also checks `expires_at > now()`, so a click one millisecond late loses fairly.
+
+---
+
+### 7.8 Order and scale: Redpanda, partitioned by key
+
+| Option | Pros | Cons | Verdict |
+|---|---|---|---|
+| **Redpanda** | Kafka API, one binary, no JVM/ZooKeeper, starts in seconds | smaller community | ✅ |
+| Apache Kafka | the standard | heavier on a laptop | switching = one env var |
+| RabbitMQ | simple, delayed messages | no replayable partitioned log | ❌ |
+
+Keys: `rideId` for ride topics and replies, `driverId` for driver topics. All messages about one ride land on one partition, **in order**; services scale out **by partition**.
+
+---
+
+### 7.9 Runtime config with a cache: radius and timeout in Redis
+
+**Problem.** The radius (AC-04) and the offer timeout (AC-05) must be configurable. As env vars, changing them means a redeploy, and every replica must agree.
+
+**Solution.** The values live in a Redis hash, read through a short **in-process cache**:
 
 ```
-            ▲  Postman / newman: 56 requests, 115 checks (one folder per AC)
-           ▲▲  E2E: 12 (REST + gRPC through nginx, OpenAPI contract, real 30 s timeout)
-         ▲▲▲▲  Integration: 23 (real Postgres 18 / Redis 8 via testcontainers)
-     ▲▲▲▲▲▲▲▲  Unit + architecture: 32 (state machines, matching, use cases with fakes)
+ dispatch start ──HSET (env values)──►  Redis  config:dispatch { match_radius_m: 2000, offer_timeout_s: 30 }
+ PUT /dispatch/config ──validate──► HSET ─┘   ▲
+ redis-cli HSET (by hand) ────────────────────┘   │ HGETALL at most once per second per replica
+                                                  │
+ matching / offer creation ──► in-process cache (TTL 1 s) ──► falls back to env values if Redis fails
 ```
 
-* AC-09 is proven on a **real database**, not a mock: an in-memory fake can't show row-lock behaviour.
-* **CI:** GitHub Actions: `lint` ∥ `test` → full stack in Docker → e2e + Postman (5 s timeout), container logs uploaded on failure.
-* **Docs:** C4 architecture, 8 sequence diagrams, 14 design patterns, 12 ADRs, requirement → code → test traceability, OpenAPI with Swagger UI.
+| Option | Pros | Cons | Verdict |
+|---|---|---|---|
+| Env vars only | simplest | redeploy to change | ❌ (still the seed) |
+| A table in Postgres | durable, transactional | a DB read per match, or a cache anyway | ❌ |
+| **Redis hash + 1 s in-process cache** | change at runtime; all replicas agree within 1 s; no Redis call per ride; Redis already in the stack | a change takes up to 1 s; resets to env on restart | ✅ |
+| Config service (etcd, Consul) | watches, history | another cluster to run | at larger scale |
+
+**Safety:** values are validated (radius 100–50,000 m, timeout 1–3,600 s) → `422 INVALID_SETTINGS`. A bad value written by hand is ignored (env values used, warning logged). If Redis loses the key, defaults are written back. A ride keeps the **radius it started with** (stored on the saga), so a change never moves the goalposts mid-dispatch.
+
+**Other caching in the design:** the Redis GEO index is itself a **read model** (CQRS), not a cache of rows. At 100k+ drivers, a ~1 s cache on `GET /rides/{id}` and push instead of polling would remove most reads (k6 F4 showed the polling storm).
+
+---
+
+### 7.10 Observability: one trace per ride
+
+* **Logs:** every line carries `ride_id`, `driver_id`, `event_id`, `causation_id`, `trace_id`.
+* **Traces:** the ride's `traceparent` is stored on the ride and the saga, so a timeout 30 s later still joins the same trace.
+* **Metrics:** offers by outcome, time to first offer, reservation conflicts, outbox backlog, consumer outcomes, HTTP latency.
+* **Demo:** every step has a `trace ↗` button straight into Tempo.
+
+---
+
+### 7.11 Boundaries: 3 services, Clean Architecture, gateway, gRPC
+
+| Choice | Why | Cost |
+|---|---|---|
+| **3 services, database per service** | Parts scale differently (locations ≫ rides); team learning goal | Eventual consistency; more infrastructure; over the timebox |
+| **Clean Architecture** | Use cases tested with fakes; SQL in one adapter; a test enforces the rules | More files, ~15 interfaces |
+| **nginx gateway** | Clients see one API; `/internal/*` hidden | First bottleneck under load (F1) |
+| **gRPC streams** for location and offers | One connection instead of a request every few seconds; offers pushed | Two API styles to maintain |
+
+A modular monolith would be enough for 1,000 drivers ([ADR-006](../docs/adr/ADR-006-service-architecture.md)); we chose services on purpose and kept them to three.
+
+---
+
+### 7.12 Proving it works
+
+```
+            ▲  k6 load tests: location, dispatch, hot zone
+           ▲▲  Postman: 115 checks, one folder per AC
+          ▲▲▲  E2E: REST + gRPC through the gateway, OpenAPI contract, real timeout
+       ▲▲▲▲▲▲  Integration: real Postgres 18 / Redis 8 (races, idempotency, saga, config)
+   ▲▲▲▲▲▲▲▲▲▲  Unit + architecture: state machines, matching, settings, use cases
+```
+
+AC-09 is proven on a **real database**: an in-memory fake cannot show row-lock behaviour.
 
 ---
 
 ## 8. 3 bottlenecks · 3 scaling strategies · 2 trade-offs
 
-(The full analysis has 6 bottlenecks, 6 strategies and 5 trade-offs: [scalability.md](../docs/scalability.md).)
+### 3 bottlenecks (2 confirmed by k6, 1 new)
 
-### 3 potential bottlenecks
+| # | Bottleneck | Breaks at (our rig) | Evidence |
+|---|---|---|---|
+| **B1** | 📍 **Location writes**: each update = row update + outbox insert + outbox update + broker message | ~1,000 req/s ≈ 4,000 online drivers | k6 F2: p95 4.5 s, backlog 114k |
+| **B2** | 🔥 **Hot zones**: many rides chase the same few drivers; more servers don't help | when demand ≈ the area's driver capacity | k6 F4: conflicts 555 %, 75.6 % success, CPU < 40 % |
+| **B3** | 🚪 **Gateway**: a new TCP connection per request, 1,024 connections max | ~1,000 req/s | k6 F1: 78k × `502` (found by testing, not predicted) |
 
-| # | Bottleneck | Why it breaks | Breaks at | How we'd see it |
-|---|---|---|---|---|
-| **B1** | **Location writes on `driver_db`** | Every update is a Postgres `UPDATE` + outbox row. One primary handles ~10–20k such writes/s; 1M drivers need **250k/s** | ~50–100k drivers | `driver_db` write p99 > 50 ms, CPU > 70 %, outbox backlog |
-| **B2** | **One Redis GEO key** | Redis runs each shard on one core; a single key can't be split across a cluster | a few 100k drivers | Redis CPU > 60 %, `GEOSEARCH` p99 > 5 ms, projector lag |
-| **B3** | **Hot zones** (airport, stadium) | Many rides chase the same nearest drivers → reservation conflicts and retries. More servers don't help: the contention is on the data | any scale, locally | conflicts / offers > 20 % in an area |
+Next in line (not reached by our tests): one Redis GEO key, partition count, the dispatch database.
 
 ### 3 scaling strategies
 
-| # | Strategy | Fixes | What it does | Cost |
-|---|---|---|---|---|
-| **S1** | **Location fast path** | B1 | Drivers stream locations over gRPC (built). Location goes to a **compacted Redpanda topic**, not a Postgres row per update; snapshot to Postgres every 30 s. Status changes stay transactional | Up to 30 s of location history lost on a crash; the next update fixes it |
-| **S2** | **Geo partitioning (H3) + area-owned dispatch** | B2, B3 | One GEO key per H3 cell across a Redis Cluster; ride events partitioned by area so **one dispatcher owns an area** and most conflicts disappear | Border rides query neighbour cells; rebalancing areas needs care |
-| **S3** | **Horizontal scale of stateless services** | throughput | 3–N replicas per service, 24–48+ partitions, sagas spread by key; workers already use `SKIP LOCKED` | Relay ordering needs leader election or CDC |
+| # | Strategy | Fixes | What it does |
+|---|---|---|---|
+| **S1** | **Location fast path** | B1 | Drivers stream locations over gRPC (built). Location goes to a compacted topic, not a Postgres row per update; snapshot to Postgres every 30 s. Status changes stay transactional. |
+| **S2** | **Geo partitioning (H3) + area-owned dispatch + batch matching** | B2 | One GEO key per H3 cell; one dispatcher owns an area; in hot cells collect requests for ~200 ms and assign them together. |
+| **S3** | **Horizontal scale of the stateless tier** | B3, throughput | Gateway keepalive + 2+ replicas behind a load balancer (tested: 0 errors at 1,000 req/s); 3+ replicas per service; more partitions. |
 
 ```mermaid
 flowchart LR
     subgraph today[Today]
-      L1[location PUT] --> PG1[(driver_db<br/>row + outbox)] --> K1{{driver.events}} --> G1[(1 GEO key)]
+      L1[PUT location] --> PG1[(driver_db<br/>row + outbox)] --> K1{{driver.events}} --> G1[(1 GEO key)]
     end
     subgraph scaled[At 1M drivers]
       L2[gRPC stream] --> K2{{driver.locations<br/>compacted, by city}} --> G2[(GEO per H3 cell<br/>Redis Cluster)]
-      K2 -. batch every 30 s .-> PG2[(driver_db<br/>sharded by city)]
-      G2 --> D2[dispatcher<br/>owns area]
+      K2 -. every 30 s .-> PG2[(driver_db<br/>sharded by city)]
+      G2 --> D2[dispatcher<br/>owns an area]
     end
 ```
 
 ### 2 architectural trade-offs
 
-| # | We chose | Over | Gained | Paid | Revisit when |
-|---|---|---|---|---|---|
-| **T1** | **Microservices + saga** | Modular monolith | Independent scaling of the location path; clear ownership; hands-on with distributed patterns | Eventual consistency (ms); more infrastructure; well over the 4–6 h timebox | Scale stays < ~50k drivers and one team owns it |
-| **T2** | **Redis GEO projection** (eventually consistent) | Querying Postgres per match | In-memory matching; no load on reservation rows; matching works if driver-service is slow | A candidate may be stale → one failed reservation, **never a wrong assignment**, because Postgres decides | Failed-reservation rate is high |
-
-What we did **not** measure: we did not run load tests. The per-node limits above are typical published orders of magnitude, not measurements of this system. Next step: k6 scenarios for location ingestion and hot-zone contention.
+| # | We chose | Over | Gained | Paid |
+|---|---|---|---|---|
+| **T1** | **Microservices + saga** | Modular monolith | The location path scales alone; clear ownership; hands-on distributed patterns | Eventual consistency, more infrastructure, well over the 4–6 h timebox. k6 showed it: under load, `complete` sometimes got `409` because the ride turned `DRIVER_ACCEPTED` a moment after the accept call |
+| **T2** | **Redis GEO projection** (eventually consistent) | Querying Postgres per match | In-memory matching; location writes never touch the reservation rows | A candidate may be stale → one failed reservation, **never a wrong assignment**, because Postgres decides (7.2) |
 
 ---
 
@@ -646,43 +990,44 @@ What we did **not** measure: we did not run load tests. The per-node limits abov
 
 ### What we learned
 
-1. **Correctness lives in the data owner, not in the cache.** "Redis suggests, Postgres decides" let us make matching fast *and* safe. A stale read costs a retry, never a bug.
-2. **One atomic statement beats a lock service.** `UPDATE … WHERE status='AVAILABLE'` and its row count solved every race we found: two rides, accept vs timeout, late releases.
-3. **At-least-once is a given; design for duplicates.** Outbox + inbox + idempotent state machines turned "what if this arrives twice?" into a non-issue at every layer.
-4. **Sagas need a pivot.** Naming the point of no return (driver accepts) made compensation rules clear: undo before, retry after.
-5. **The hard part is the edges, not the happy path.** Cancel during reserve, accept 1 ms before timeout, a reply lost in a crash: most of our tests and sequence diagrams are about these.
-6. **Microservices have a real cost.** For 1k drivers a modular monolith would be enough. We paid in infrastructure, eventual consistency and time, and we learned exactly *where* that cost is worth it (the location path at 100k+).
-7. **Write the ADR while deciding.** The 12 ADRs forced us to compare options honestly and made this presentation easy.
-8. **Observability is a feature.** Storing the ride's trace context gave one trace per ride across services, minutes apart, which made debugging the saga much faster.
+1. **Correctness lives with the data owner, not in the cache.** "Redis suggests, Postgres decides" made matching fast *and* safe.
+2. **One CAS statement beats a lock service.** Every race we found was decided by `UPDATE … WHERE …` and its row count.
+3. **Design for duplicates.** At-least-once is a given; outbox + inbox + idempotent state machines made "what if this arrives twice?" a non-question.
+4. **Name the pivot.** Once we agreed "accept is the point of no return", the compensation rules were obvious.
+5. **The edges are the work.** Cancel during reserve, accept one millisecond before timeout, a reply lost in a crash: most of our tests and diagrams are about these.
+6. **Measure, don't guess.** k6 found a bottleneck we never predicted (the gateway) and showed our 50k-driver estimate for location writes was optimistic on one machine.
+7. **HTTP metrics can lie.** In the hot zone, latency and errors looked perfect while a quarter of passengers got no driver. Alert on business metrics.
+8. **Write it down while you decide.** The ADRs ended debates and made this presentation easy.
 
-### Known limitations (honest list)
+### Known limitations
 
 | Limitation | Next step |
 |---|---|
 | Accept returns at the pivot; the ride shows `DRIVER_ACCEPTED` a few ms later | Return the expected final state |
 | A ride with no driver waits in `MATCHING` forever | Auto-cancel after a max wait |
-| One outbox relay per instance; replicas could publish out of order | Leader election or CDC |
-| No cleanup jobs for inbox/outbox/idempotency rows | Time-based deletes or partition drops |
-| No authentication | JWT at the gateway, per-driver authorisation |
-| Not load-tested | k6 scenarios |
+| One outbox relay per instance | Leader election or CDC |
+| No cleanup of inbox/outbox/idempotency rows | Time-based deletes |
+| Gateway fix tested but not committed | Keepalive + replicas |
+| Load tests on one shared laptop | Repeat on dedicated hosts |
+| No authentication | JWT at the gateway |
 
 ### Discussion
 
-* Would you start this as a **modular monolith** and extract the location path later? Where is the line?
-* **Greedy nearest vs batch matching**: when does fleet-wide optimisation beat the simple rule the spec asks for?
-* **Hand-rolled saga vs Temporal**: how many workflows before a workflow engine pays off?
-* How would you **test the race conditions** that only show up under real load?
+* Would you start as a **modular monolith** and split out the location path later? Where is the line?
+* **Greedy nearest vs batch matching**: when does area-wide assignment beat the simple rule?
+* **Hand-rolled saga vs Temporal**: how many workflows before an engine pays off?
+* Our hot zone failed **silently** at the HTTP level. Which metric would you page on?
 
 ### Conclusion
 
 | | |
 |---|---|
 | **Requirements** | All 10 ACs met, each traced to code and an automated test |
-| **Correctness** | Every race decided by one atomic statement in the owning service; duplicates harmless at every layer |
-| **Architecture** | 3 services, saga + outbox/inbox, Redis GEO + Postgres, one trace per ride |
-| **Quality** | 32 unit + 23 integration + 12 e2e + 115 Postman checks, CI on every push |
-| **Growth path** | Clear route from 1k to 1M drivers: location fast path → H3 geo partitioning → area-owned dispatch |
+| **Correctness** | Every race decided by one CAS statement in the owning service; duplicates harmless everywhere |
+| **Architecture** | 3 services, saga + outbox/inbox, Redis GEO + live config, Postgres as the truth, one trace per ride |
+| **Evidence** | Unit, integration, e2e, Postman, CI, a live demo of 4 sequence diagrams, and k6 load tests |
+| **Growth** | Measured bottlenecks and a clear path: gateway → location fast path → H3 areas and batch matching |
 
-> **One mission:** a dispatch service that is small enough to run with `make up`, correct under concurrency and duplicates, and designed to grow. **Thank you! Questions?** 🙌
+> **One mission:** a dispatch service small enough to run with `make up`, correct under races and duplicates, measured under load, and ready to grow. **Thank you! Questions?** 🙌
 
-**Links:** [README](../README.md) · [Architecture](../docs/architecture.md) · [Sequence diagrams](../docs/sequence-diagram.md) · [Patterns](../docs/patterns.md) · [Scalability](../docs/scalability.md) · [ADRs](../docs/adr/README.md) · [Testing](../docs/testing.md)
+**Links:** [README](../README.md) · [Architecture](../docs/architecture.md) · [Sequence diagrams](../docs/sequence-diagram.md) · [Patterns](../docs/patterns.md) · [Scalability](../docs/scalability.md) · [Load test report](../docs/load-test-report.md) · [ADRs](../docs/adr/README.md) · [Testing](../docs/testing.md)

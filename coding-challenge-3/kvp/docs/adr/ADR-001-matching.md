@@ -42,7 +42,7 @@ A ride must be offered to the **nearest `AVAILABLE` driver within a configurable
    func SelectNearest(pickup geo.Point, cands []Candidate, radiusM float64, excluded map[string]bool) (Ranked, bool)
    ```
    It drops excluded and non-`AVAILABLE` drivers, computes Haversine from exact coordinates, cuts at the radius, sorts by `(distance, driverId)` and takes the first.
-4. `MATCH_RADIUS_M` (default `2000`) configures the radius.
+4. The radius is configurable at runtime: dispatch keeps it (with the offer timeout) in the Redis hash `config:dispatch`, seeded from `MATCH_RADIUS_M` (default `2000`) on start and changed with `PUT /dispatch/config` or `HSET`. Dispatch caches it for 1 s, so matching does not add a Redis call per ride; each saga stores the radius it started with.
 5. **Redis is only a hint.** driver-service confirms the pick atomically ([ADR-002](ADR-002-concurrency.md)). A stale candidate costs one retry, never a wrong assignment.
 
 ## Consequences

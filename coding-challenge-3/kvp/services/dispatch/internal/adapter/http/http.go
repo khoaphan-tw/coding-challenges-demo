@@ -21,7 +21,27 @@ import (
 type Handler struct {
 	Orchestrator *usecase.Orchestrator
 	Projection   *usecase.Projection
+	Settings     *usecase.LiveSettings
 	Ready        func(context.Context) error
+}
+
+// SettingsJSON is the live dispatch config (GET/PUT /dispatch/config).
+type SettingsJSON struct {
+	MatchRadiusM        float64 `json:"matchRadiusM"`
+	OfferTimeoutSeconds float64 `json:"offerTimeoutSeconds"`
+	Source              string  `json:"source"`   // redis | default
+	RedisKey            string  `json:"redisKey"` // where to change it by hand
+}
+
+// SettingsPatchJSON is the body of PUT /dispatch/config; omitted fields keep their value.
+type SettingsPatchJSON struct {
+	MatchRadiusM        *float64 `json:"matchRadiusM"`
+	OfferTimeoutSeconds *float64 `json:"offerTimeoutSeconds"`
+}
+
+func presentSettings(v usecase.SettingsView) SettingsJSON {
+	return SettingsJSON{MatchRadiusM: v.Settings.MatchRadiusM, OfferTimeoutSeconds: v.Settings.OfferTimeout.Seconds(),
+		Source: v.Source, RedisKey: "config:dispatch"}
 }
 
 // OfferResponse is returned by accept/reject.
@@ -158,6 +178,33 @@ func (h *Handler) Routes(mux *http.ServeMux) {
 			return
 		}
 		httpx.WriteJSON(w, 200, presentOffer(*off))
+	})
+
+	// Live dispatch config, stored in Redis (config:dispatch): radius for new
+	// rides, timeout for new offers. Picked up by every replica within ~1 s.
+	mux.HandleFunc("GET /dispatch/config", func(w http.ResponseWriter, r *http.Request) {
+		httpx.WriteJSON(w, 200, presentSettings(h.Settings.View(r.Context())))
+	})
+	mux.HandleFunc("PUT /dispatch/config", func(w http.ResponseWriter, r *http.Request) {
+		var body SettingsPatchJSON
+		if err := httpx.DecodeJSON(r, &body); err != nil {
+			httpx.WriteError(r.Context(), w, err)
+			return
+		}
+		patch := usecase.SettingsPatch{MatchRadiusM: body.MatchRadiusM}
+		if body.OfferTimeoutSeconds != nil {
+			d := time.Duration(*body.OfferTimeoutSeconds * float64(time.Second))
+			patch.OfferTimeout = &d
+		}
+		if _, err := h.Settings.Update(r.Context(), patch); err != nil {
+			var invalid *usecase.InvalidSettingsError
+			if errors.As(err, &invalid) {
+				err = httpx.NewError(422, "INVALID_SETTINGS", invalid.Error())
+			}
+			httpx.WriteError(r.Context(), w, err)
+			return
+		}
+		httpx.WriteJSON(w, 200, presentSettings(h.Settings.View(r.Context())))
 	})
 
 	mux.HandleFunc("POST /internal/geo/rebuild", func(w http.ResponseWriter, r *http.Request) {

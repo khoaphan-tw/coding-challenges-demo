@@ -27,12 +27,14 @@ type Orchestrator struct {
 	Candidates CandidateSource
 	Publisher  Publisher
 	Inbox      Inbox
-	Radius     RadiusProvider       // optional live radius (Redis); falls back to RadiusM
-	Timeout    OfferTimeoutProvider // optional live offer timeout (Redis); falls back to OfferTimeout
 
-	RadiusM       float64       // static fallback, default 2000
-	OfferTimeout  time.Duration // default 30s
+	RadiusM       float64       // default 2000; fallback when Live is nil
+	OfferTimeout  time.Duration // default 30s; fallback when Live is nil
 	RetryInterval time.Duration // WAITING_FOR_DRIVER retry, default 10s
+
+	// Live, when set, supplies the radius and offer timeout at runtime
+	// (Redis hash config:dispatch, see LiveSettings).
+	Live SettingsSource
 
 	offers       metric.Int64Counter
 	matchLatency metric.Float64Histogram
@@ -56,25 +58,17 @@ func (o *Orchestrator) Init() *Orchestrator {
 	return o
 }
 
-// currentRadius returns the live radius, or the static fallback when the
-// provider is absent or fails.
-func (o *Orchestrator) currentRadius(ctx context.Context) float64 {
-	if o.Radius != nil {
-		if r, err := o.Radius.Radius(ctx); err == nil && r > 0 {
-			return r
-		}
-	}
-	return o.RadiusM
+// SettingsSource returns the dispatch settings in force now.
+type SettingsSource interface {
+	Current(ctx context.Context) domain.Settings
 }
 
-// currentOfferTimeout returns the live offer timeout, or the static fallback.
-func (o *Orchestrator) currentOfferTimeout(ctx context.Context) time.Duration {
-	if o.Timeout != nil {
-		if d, err := o.Timeout.OfferTimeout(ctx); err == nil && d > 0 {
-			return d
-		}
+// settings returns the radius and offer timeout in force now.
+func (o *Orchestrator) settings(ctx context.Context) domain.Settings {
+	if o.Live != nil {
+		return o.Live.Current(ctx)
 	}
-	return o.OfferTimeout
+	return domain.Settings{MatchRadiusM: o.RadiusM, OfferTimeout: o.OfferTimeout}
 }
 
 func (o *Orchestrator) countOffer(ctx context.Context, outcome string) {
@@ -168,11 +162,10 @@ func (o *Orchestrator) lockSaga(ctx context.Context, rideID string) (domain.Saga
 func (o *Orchestrator) HandleRideEvent(ctx context.Context, ev RideEvent) error {
 	switch ev.Type {
 	case messaging.RideRequested:
-		radius := o.currentRadius(ctx)
 		return o.inTx(ctx, ev.EventID, func(ctx context.Context) error {
 			// ctx is already in the ride's trace (propagated through the event).
 			created, err := o.Sagas.Create(ctx, domain.Saga{RideID: ev.RideID, Status: domain.Started,
-				Pickup: ev.Pickup, RadiusM: radius, TraceParent: obs.TraceParent(ctx)})
+				Pickup: ev.Pickup, RadiusM: o.settings(ctx).MatchRadiusM, TraceParent: obs.TraceParent(ctx)})
 			if err != nil {
 				return err
 			}
@@ -324,7 +317,7 @@ func (o *Orchestrator) onReserved(ctx context.Context, s domain.Saga, r Reply) e
 		}
 		return o.send(ctx, messaging.CmdReleaseDriver, s.RideID, r.DriverID, r.OfferID)
 	}
-	timeout := o.currentOfferTimeout(ctx)
+	timeout := o.settings(ctx).OfferTimeout
 	if err := o.Offers.Create(ctx, r.OfferID, s.RideID, r.DriverID, timeout); err != nil {
 		if errors.Is(err, ErrDuplicatePendingOffer) { // defence in depth (ADR-002)
 			return fmt.Errorf("driver %s: %w", r.DriverID, err)
