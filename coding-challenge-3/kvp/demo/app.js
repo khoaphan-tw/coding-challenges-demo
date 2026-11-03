@@ -7,6 +7,9 @@
   const qs = new URLSearchParams(location.search);
   // Served by the gateway at :8080/demo/ → same origin. Opened any other way → call localhost:8080.
   const BASE = qs.get('api') ?? (location.port === '8080' ? '' : 'http://localhost:8080');
+  // Map speed of a driver on a trip, in km/h. Time-lapsed: a real 30 km/h would take minutes.
+  // Lower = slower. Override per visit with ?speed=150.
+  const DRIVE_KMH = +qs.get('speed') || 400;
   const DRIVER_IDS = Array.from({ length: 20 }, (_, i) => 'D' + String(i + 1).padStart(3, '0'));
   const TERMINAL = new Set(['COMPLETED', 'CANCELLED']);
   const RIDE_FLOW = ['REQUESTED', 'MATCHING', 'DRIVER_ASSIGNED', 'DRIVER_ACCEPTED', 'COMPLETED'];
@@ -425,12 +428,14 @@
   }
 
   // Moves a driver along a path and reports each position to the API (real PUT /location calls).
-  async function animateDriver(tok, id, path, ms) {
+  // Duration comes from the route length and DRIVE_KMH (at least 1.5 s).
+  async function animateDriver(tok, id, path) {
     const m = S.markers.get(id); if (!m) return;
     S.animating.add(id);
     const cum = [0];
     for (let i = 1; i < path.length; i++) cum.push(cum[i - 1] + haversine(path[i - 1], path[i]));
     const total = cum[cum.length - 1] || 1;
+    const ms = Math.max(1500, (total / 1000 / DRIVE_KMH) * 3600 * 1000);
     let lastSent = 0;
     const t0 = performance.now();
     try {
@@ -455,7 +460,7 @@
     check(tok);
   }
 
-  async function driveTrip(rideId, tok, { complete = true, fast = false } = {}) {
+  async function driveTrip(rideId, tok, { complete = true } = {}) {
     const ride = await getRide(rideId);
     const id = ride.assignedDriverId, d = S.drivers.get(id);
     const pick = [ride.pickup.latitude, ride.pickup.longitude], dest = [ride.destination.latitude, ride.destination.longitude];
@@ -464,10 +469,10 @@
     const l1 = L.polyline(toPick, { color: '#3b82f6', weight: 5, opacity: 0.85, className: 'flow-line' }).addTo(sceneLayer);
     const l2 = L.polyline(trip, { color: '#e879f9', weight: 4, opacity: 0.6, dashArray: '2 8' }).addTo(sceneLayer);
     map.flyToBounds(L.latLngBounds([...toPick, ...trip]).pad(0.25), { duration: 0.8 });
-    await animateDriver(tok, id, toPick, fast ? 3000 : 4200);
+    await animateDriver(tok, id, toPick);
     l1.remove();
     l2.setStyle({ color: '#3b82f6', opacity: 0.9, dashArray: null, weight: 5 });
-    await animateDriver(tok, id, trip, fast ? 4500 : 6000);
+    await animateDriver(tok, id, trip);
     l2.remove();
     return complete ? api('POST', `/rides/${rideId}/complete`) : null;
   }
@@ -917,7 +922,7 @@
     { trip: true, live: true,
       kicker: 'The trip · AC-03', title: 'D001 drives to the pickup, then to the destination',
       text: () => 'Every move is a real <b>PUT /drivers/D001/location</b>: latest location stored with a version, published as DriverLocationUpdated.',
-      run: async (c, tok) => { await driveTrip(c.R1, tok, { complete: false, fast: true }); c.dTrip = (await api('GET', `/drivers/${c.drv}`, null, { quiet: true })).data; },
+      run: async (c, tok) => { await driveTrip(c.R1, tok, { complete: false }); c.dTrip = (await api('GET', `/drivers/${c.drv}`, null, { quiet: true })).data; },
       detail: (c) => c.dTrip,
       links: [topic('driver.events.v1', 'drv'), table('driver_db', 'drivers', 'id', 'drv'), redisDriver, () => ['Grafana', 'dashboard', gDash()]] },
     { row: { f: LD, t: LRS, txt: 'POST /rides/R1/complete', ac: 'AC-06' },
