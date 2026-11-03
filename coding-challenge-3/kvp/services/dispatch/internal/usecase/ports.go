@@ -76,6 +76,12 @@ type CandidateSource interface {
 	Candidates(ctx context.Context, pickup geo.Point, radiusM float64, count int) ([]domain.Candidate, error)
 }
 
+// RadiusProvider supplies the current max pickup distance. It is read when a
+// saga is created, so a changed value applies to new rides without a restart.
+type RadiusProvider interface {
+	Radius(ctx context.Context) (float64, error)
+}
+
 // GeoIndex is the writable side of the driver projection (Redis GEO).
 type GeoIndex interface {
 	// Apply records status/location at version; false if the version is not newer.

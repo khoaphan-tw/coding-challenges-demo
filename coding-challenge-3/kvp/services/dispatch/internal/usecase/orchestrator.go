@@ -27,8 +27,9 @@ type Orchestrator struct {
 	Candidates CandidateSource
 	Publisher  Publisher
 	Inbox      Inbox
+	Radius     RadiusProvider // optional live radius (Redis); falls back to RadiusM
 
-	RadiusM       float64       // default 2000
+	RadiusM       float64       // static fallback, default 2000
 	OfferTimeout  time.Duration // default 30s
 	RetryInterval time.Duration // WAITING_FOR_DRIVER retry, default 10s
 
@@ -52,6 +53,17 @@ func (o *Orchestrator) Init() *Orchestrator {
 	o.matchLatency, _ = m.Float64Histogram("dispatch_match_duration_seconds",
 		metric.WithDescription("Ride requested to offer created"), metric.WithUnit("s"))
 	return o
+}
+
+// currentRadius returns the live radius, or the static fallback when the
+// provider is absent or fails.
+func (o *Orchestrator) currentRadius(ctx context.Context) float64 {
+	if o.Radius != nil {
+		if r, err := o.Radius.Radius(ctx); err == nil && r > 0 {
+			return r
+		}
+	}
+	return o.RadiusM
 }
 
 func (o *Orchestrator) countOffer(ctx context.Context, outcome string) {
@@ -145,10 +157,11 @@ func (o *Orchestrator) lockSaga(ctx context.Context, rideID string) (domain.Saga
 func (o *Orchestrator) HandleRideEvent(ctx context.Context, ev RideEvent) error {
 	switch ev.Type {
 	case messaging.RideRequested:
+		radius := o.currentRadius(ctx)
 		return o.inTx(ctx, ev.EventID, func(ctx context.Context) error {
 			// ctx is already in the ride's trace (propagated through the event).
 			created, err := o.Sagas.Create(ctx, domain.Saga{RideID: ev.RideID, Status: domain.Started,
-				Pickup: ev.Pickup, RadiusM: o.RadiusM, TraceParent: obs.TraceParent(ctx)})
+				Pickup: ev.Pickup, RadiusM: radius, TraceParent: obs.TraceParent(ctx)})
 			if err != nil {
 				return err
 			}

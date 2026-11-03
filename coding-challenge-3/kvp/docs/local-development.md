@@ -282,7 +282,9 @@ Set in [docker-compose.yml](../docker-compose.yml). The dispatch values can be o
 
 | Variable | Default | Service | Meaning |
 |---|---|---|---|
-| `MATCH_RADIUS_M` | `2000` | dispatch | Max pickup distance in metres |
+| `MATCH_RADIUS_M` | `2000` | dispatch | Initial max pickup distance in metres. Seeds Redis key `config:match_radius_m` if absent; after that Redis is the source of truth. Change live: `redis-cli SET config:match_radius_m 3000` (no restart; applies to new rides within ~2 s) |
+| `MATCH_RADIUS_TTL` | `720h` | dispatch | TTL of the Redis radius key (refreshed on every read) |
+| `MATCH_RADIUS_CACHE` | `2s` | dispatch | In-process cache of the radius to keep it off the hot path |
 | `OFFER_TIMEOUT` | `30s` | dispatch | Time a driver has to answer |
 | `DISPATCH_RETRY_INTERVAL` | `10s` | dispatch | Retry when no driver was available (also retried at once when any driver becomes available) |
 | `SWEEPER_INTERVAL` | `1s` | dispatch | How often expired offers are checked |
