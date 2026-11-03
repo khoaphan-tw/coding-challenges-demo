@@ -44,6 +44,13 @@ func main() {
 		offerTimeout := svc.Duration("OFFER_TIMEOUT", 30*time.Second)
 		live := redis.NewLiveConfig(rdb, radius, offerTimeout,
 			svc.Duration("CONFIG_TTL", 30*24*time.Hour), svc.Duration("CONFIG_CACHE", 2*time.Second))
+		// Seed the keys now so they are visible/editable in Redis before any traffic.
+		if _, err := live.Radius(ctx); err != nil {
+			slog.WarnContext(ctx, "could not seed config:match_radius_m", "error", err)
+		}
+		if _, err := live.OfferTimeout(ctx); err != nil {
+			slog.WarnContext(ctx, "could not seed config:offer_timeout", "error", err)
+		}
 		orch := (&usecase.Orchestrator{
 			Tx:            pgutil.TxManager{Pool: rt.Pool},
 			Sagas:         sagas,
