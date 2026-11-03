@@ -428,12 +428,15 @@
   // Moves a driver along a path and reports its position to the API every LOCATION_EVERY_MS
   // (real PUT /location calls), plus once on arrival. The marker itself moves smoothly.
   const LOCATION_EVERY_MS = 2000;
-  async function animateDriver(tok, id, path, ms) {
+  // Optional ?speed=<km/h> makes the duration depend on the route length (time-lapsed: 400 is a good start); lower = slower.
+  const DRIVE_KMH = +qs.get('speed') || 0;
+  async function animateDriver(tok, id, path, msFixed) {
     const m = S.markers.get(id); if (!m) return;
     S.animating.add(id);
     const cum = [0];
     for (let i = 1; i < path.length; i++) cum.push(cum[i - 1] + haversine(path[i - 1], path[i]));
     const total = cum[cum.length - 1] || 1;
+    const ms = DRIVE_KMH ? Math.max(1500, (total / 1000 / DRIVE_KMH) * 3600 * 1000) : msFixed;
     const t0 = performance.now();
     let lastSent = t0; // the start position is already stored
     try {
