@@ -27,7 +27,8 @@ type Orchestrator struct {
 	Candidates CandidateSource
 	Publisher  Publisher
 	Inbox      Inbox
-	Radius     RadiusProvider // optional live radius (Redis); falls back to RadiusM
+	Radius     RadiusProvider       // optional live radius (Redis); falls back to RadiusM
+	Timeout    OfferTimeoutProvider // optional live offer timeout (Redis); falls back to OfferTimeout
 
 	RadiusM       float64       // static fallback, default 2000
 	OfferTimeout  time.Duration // default 30s
@@ -64,6 +65,16 @@ func (o *Orchestrator) currentRadius(ctx context.Context) float64 {
 		}
 	}
 	return o.RadiusM
+}
+
+// currentOfferTimeout returns the live offer timeout, or the static fallback.
+func (o *Orchestrator) currentOfferTimeout(ctx context.Context) time.Duration {
+	if o.Timeout != nil {
+		if d, err := o.Timeout.OfferTimeout(ctx); err == nil && d > 0 {
+			return d
+		}
+	}
+	return o.OfferTimeout
 }
 
 func (o *Orchestrator) countOffer(ctx context.Context, outcome string) {
@@ -313,7 +324,8 @@ func (o *Orchestrator) onReserved(ctx context.Context, s domain.Saga, r Reply) e
 		}
 		return o.send(ctx, messaging.CmdReleaseDriver, s.RideID, r.DriverID, r.OfferID)
 	}
-	if err := o.Offers.Create(ctx, r.OfferID, s.RideID, r.DriverID, o.OfferTimeout); err != nil {
+	timeout := o.currentOfferTimeout(ctx)
+	if err := o.Offers.Create(ctx, r.OfferID, s.RideID, r.DriverID, timeout); err != nil {
 		if errors.Is(err, ErrDuplicatePendingOffer) { // defence in depth (ADR-002)
 			return fmt.Errorf("driver %s: %w", r.DriverID, err)
 		}
@@ -328,7 +340,7 @@ func (o *Orchestrator) onReserved(ctx context.Context, s domain.Saga, r Reply) e
 	}
 	o.countOffer(ctx, "created")
 	o.matchLatency.Record(ctx, time.Since(s.CreatedAt).Seconds())
-	if err := o.step(ctx, s, domain.Offered, fmt.Sprintf("offer created, driver has %s to respond", o.OfferTimeout),
+	if err := o.step(ctx, s, domain.Offered, fmt.Sprintf("offer created, driver has %s to respond", timeout),
 		r.DriverID, r.OfferID); err != nil {
 		return err
 	}

@@ -82,6 +82,12 @@ type RadiusProvider interface {
 	Radius(ctx context.Context) (float64, error)
 }
 
+// OfferTimeoutProvider supplies how long a driver has to answer an offer. It is
+// read when an offer is created, so a changed value applies to new offers.
+type OfferTimeoutProvider interface {
+	OfferTimeout(ctx context.Context) (time.Duration, error)
+}
+
 // GeoIndex is the writable side of the driver projection (Redis GEO).
 type GeoIndex interface {
 	// Apply records status/location at version; false if the version is not newer.

@@ -41,19 +41,21 @@ func main() {
 
 		// Use cases.
 		radius, _ := strconv.ParseFloat(svc.Env("MATCH_RADIUS_M", "2000"), 64)
+		offerTimeout := svc.Duration("OFFER_TIMEOUT", 30*time.Second)
+		live := redis.NewLiveConfig(rdb, radius, offerTimeout,
+			svc.Duration("CONFIG_TTL", 30*24*time.Hour), svc.Duration("CONFIG_CACHE", 2*time.Second))
 		orch := (&usecase.Orchestrator{
-			Tx:         pgutil.TxManager{Pool: rt.Pool},
-			Sagas:      sagas,
-			Offers:     &postgres.Offers{Pool: rt.Pool},
-			Exclusions: &postgres.Exclusions{Pool: rt.Pool},
-			Candidates: index,
-			Publisher:  broker.Publisher{},
-			Inbox:      broker.Inbox{Consumer: dmsg.ConsumerName},
-			Radius: &redis.RadiusConfig{R: rdb, Default: radius,
-				TTL:      svc.Duration("MATCH_RADIUS_TTL", 30*24*time.Hour),
-				CacheFor: svc.Duration("MATCH_RADIUS_CACHE", 2*time.Second)},
+			Tx:            pgutil.TxManager{Pool: rt.Pool},
+			Sagas:         sagas,
+			Offers:        &postgres.Offers{Pool: rt.Pool},
+			Exclusions:    &postgres.Exclusions{Pool: rt.Pool},
+			Candidates:    index,
+			Publisher:     broker.Publisher{},
+			Inbox:         broker.Inbox{Consumer: dmsg.ConsumerName},
+			Radius:        live,
+			Timeout:       live,
 			RadiusM:       radius,
-			OfferTimeout:  svc.Duration("OFFER_TIMEOUT", 30*time.Second),
+			OfferTimeout:  offerTimeout,
 			RetryInterval: svc.Duration("DISPATCH_RETRY_INTERVAL", 10*time.Second),
 		}).Init()
 		proj := &usecase.Projection{Index: index, OnAvailable: orch.WakeWaiting,
